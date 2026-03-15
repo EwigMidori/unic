@@ -16,6 +16,8 @@ CLI（另开一个终端）：
 cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 ```
 
+`unicos-cli` 使用 `reedline` 提供输入高亮与 Tab 补全（按 `Tab` 打开补全菜单，`/quit` 退出）。
+
 守护进程默认读取 `/etc/unicos/config.toml`（不存在则使用内置默认值）。
 
 `paths` 通过环境变量配置：
