@@ -98,10 +98,11 @@ async fn handle_client(
                     .await?;
                 w.write_all(b"\n").await?;
             }
-            ClientRequest::Publish { topic, text, sender } => {
-                bus.publish(bus.envelope(
+            ClientRequest::Publish { topic, text, sender, conversation_id } => {
+                bus.publish(bus.envelope_with_conversation(
                     topic,
                     sender,
+                    conversation_id,
                     Event::Message(Message { text }),
                 ))?;
             }
@@ -139,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus = orchestrator.bus();
     let cancel = orchestrator.cancel_token();
     let _god = orchestrator.spawn_god_logger();
+    let _convs = orchestrator.spawn_conversation_aggregator();
 
     let mut core_task = tokio::spawn(async move {
         if no_fs_watch {

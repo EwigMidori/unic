@@ -23,6 +23,7 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 `paths` 通过环境变量配置：
 - `UNICOS_UNICS_DIR`：Agent 灵魂区目录（默认 `/etc/unicos/unics`）
 - `UNICOS_GOD_LOG`：上帝日志路径（默认 `/var/lib/unicos/god.log`）
+- `UNICOS_CONVERSATIONS_DIR`：会话聚合目录（默认 `/var/lib/unicos/conversations`）
 
 要接入 `/responses` 模型提供商，参考 `config.example.toml` 增加 `[llm]` 与 `[llm.responses]` 配置。
 
@@ -33,6 +34,7 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
   - `/agents`（列出当前运行中的 Agent）
   - `/dm <AgentId>`（切到与该 Agent 的私聊 topic，并让它 join）
   - `/topic <name>`
+  - `/conv <seed-or-64hex-id>`（切换当前 conversation_id；会在后台聚合成 `{conv_id}.json`）
   - `/spawn <AgentId>`
   - `/kill <AgentId>`
   - `/purge <AgentId>`（两步确认：先请求，再 `/purge <AgentId> yes` 真正删除磁盘目录）
@@ -48,6 +50,12 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 `/spawn <AgentId>` 会在该目录下自动生成默认的 `soul.md` 与 `config.json`（若不存在）。
 
 每个 Agent 还会维护一个 `mailbox.log`（JSONL），记录它“实际接收并进入感知”的所有消息。
+
+## Conversations（会话聚合）
+
+守护进程会按 `conversation_id` 将消息 ID 聚合到 `$UNICOS_CONVERSATIONS_DIR/{conv_id}.json`，用于后续按会话回溯完整上下文。
+
+Agent 可通过工具 `conv_load` 读取某个 `conversation_id` 的消息列表并从上帝日志反查消息内容。
 
 ## Ping/Pong（只改 SOUL.md）
 
@@ -80,6 +88,7 @@ retries = 8
 ```bash
 export UNICOS_UNICS_DIR=/tmp/unicos-unics
 export UNICOS_GOD_LOG=/tmp/unicos-god.log
+export UNICOS_CONVERSATIONS_DIR=/tmp/unicos-conversations
 cargo run -p unicosd -- --config /tmp/unicos-config.toml
 ```
 
@@ -114,5 +123,6 @@ EOF
 - `!bash <cmd>`
 - `!fs_read <path>`
 - `!net_get <url>`
+- `!conv_load <seed-or-64hex-id>`
 
 工具返回会以普通消息形式回流到总线。

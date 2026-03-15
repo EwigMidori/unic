@@ -1,6 +1,6 @@
 use chrono::Utc;
 use tokio::sync::broadcast;
-use unicos_common::{Envelope, Event, Sender, Topic, UnicError};
+use unicos_common::{ConversationId, Envelope, Event, Sender, Topic, UnicError};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -31,6 +31,24 @@ impl Bus {
             ts: Utc::now(),
             topic,
             sender,
+            conversation_id: ConversationId::default(),
+            payload,
+        }
+    }
+
+    pub fn envelope_with_conversation(
+        &self,
+        topic: Topic,
+        sender: Sender,
+        conversation_id: ConversationId,
+        payload: Event,
+    ) -> Envelope<Event> {
+        Envelope {
+            id: Uuid::now_v7(),
+            ts: Utc::now(),
+            topic,
+            sender,
+            conversation_id,
             payload,
         }
     }

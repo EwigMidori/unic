@@ -3,11 +3,13 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
-use unicos_common::UnicError;
+use unicos_common::{ConversationId, Envelope, Event, UnicError};
+use uuid::Uuid;
 
 #[async_trait]
 pub trait SystemTool: Send + Sync {
@@ -32,6 +34,7 @@ impl ToolRegistry {
         reg.register(BashExecutor::default());
         reg.register(FileSystemOperator::default());
         reg.register(NetRequestTool::default());
+        reg.register(ConversationLoader::default());
         reg
     }
 
@@ -205,5 +208,165 @@ impl SystemTool for NetRequestTool {
             "headers": headers,
             "body": body,
         }))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ConversationLoader;
+
+#[derive(Debug, Deserialize)]
+struct ConvLoadArgs {
+    conversation_id: String,
+    max_messages: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationFile {
+    conversation_id: ConversationId,
+    message_ids: Vec<Uuid>,
+}
+
+#[async_trait]
+impl SystemTool for ConversationLoader {
+    fn name(&self) -> &'static str {
+        "conv_load"
+    }
+
+    async fn call(&self, args: Value) -> Result<Value, UnicError> {
+        let args: ConvLoadArgs = serde_json::from_value(args)?;
+        let conv_id = ConversationId::parse_hex(&args.conversation_id)
+            .unwrap_or_else(|| ConversationId::from_seed(&args.conversation_id));
+
+        let conversations_dir = std::env::var_os("UNICOS_CONVERSATIONS_DIR")
+            .map(|v| v.to_string_lossy().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/var/lib/unicos/conversations".to_string());
+        let conversations_dir = PathBuf::from(conversations_dir);
+
+        let god_log = std::env::var_os("UNICOS_GOD_LOG")
+            .map(|v| v.to_string_lossy().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/var/lib/unicos/god.log".to_string());
+        let god_log = PathBuf::from(god_log);
+
+        let conv_path = conversations_dir.join(format!("{}.json", conv_id.as_str()));
+        let conv_json = tokio::fs::read_to_string(&conv_path).await?;
+        let conv_file: ConversationFile = serde_json::from_str(&conv_json)?;
+        if conv_file.conversation_id != conv_id {
+            return Err(UnicError::Tool(format!(
+                "conv_load: conversation_id mismatch in {}",
+                conv_path.display()
+            )));
+        }
+
+        let mut wanted = conv_file
+            .message_ids
+            .into_iter()
+            .collect::<Vec<Uuid>>();
+        let max = args.max_messages.unwrap_or(200).max(1);
+        if wanted.len() > max {
+            wanted = wanted[wanted.len() - max..].to_vec();
+        }
+        let wanted_set = wanted.iter().cloned().collect::<HashSet<Uuid>>();
+
+        let god = tokio::fs::read_to_string(&god_log).await?;
+        let mut by_id: HashMap<Uuid, Value> = HashMap::new();
+        for line in god.lines() {
+            let Ok(env) = serde_json::from_str::<Envelope<Event>>(line) else { continue };
+            if !wanted_set.contains(&env.id) {
+                continue;
+            }
+            let Event::Message(m) = env.payload else { continue };
+            by_id.insert(
+                env.id,
+                json!({
+                    "id": env.id,
+                    "ts": env.ts,
+                    "topic": env.topic,
+                    "sender": env.sender,
+                    "conversation_id": env.conversation_id,
+                    "text": m.text,
+                }),
+            );
+        }
+
+        let mut messages = Vec::new();
+        let mut missing = Vec::new();
+        for id in wanted {
+            if let Some(v) = by_id.get(&id) {
+                messages.push(v.clone());
+            } else {
+                missing.push(id);
+            }
+        }
+
+        Ok(json!({
+            "conversation_id": conv_id,
+            "conv_path": conv_path,
+            "god_log": god_log,
+            "messages": messages,
+            "missing_message_ids": missing,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use unicos_common::{Message, Sender, Topic};
+
+    #[tokio::test]
+    async fn conv_load_reads_conversation_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv_dir = tmp.path().join("conversations");
+        let god_log = tmp.path().join("god.log");
+        tokio::fs::create_dir_all(&conv_dir).await.unwrap();
+
+        unsafe {
+            std::env::set_var("UNICOS_CONVERSATIONS_DIR", conv_dir.to_string_lossy().to_string());
+            std::env::set_var("UNICOS_GOD_LOG", god_log.to_string_lossy().to_string());
+        }
+
+        let conv_id = ConversationId::from_seed("task-42");
+        let env = Envelope {
+            id: Uuid::now_v7(),
+            ts: chrono::Utc::now(),
+            topic: Topic::new("general"),
+            sender: Sender::UserSudo,
+            conversation_id: conv_id.clone(),
+            payload: Event::Message(Message {
+                text: "hello".to_string(),
+            }),
+        };
+
+        let god_line = serde_json::to_string(&env).unwrap();
+        tokio::fs::write(&god_log, format!("{god_line}\n")).await.unwrap();
+
+        let conv_path = conv_dir.join(format!("{}.json", conv_id.as_str()));
+        tokio::fs::write(
+            &conv_path,
+            serde_json::to_string_pretty(&json!({
+                "conversation_id": conv_id.clone(),
+                "message_ids": [env.id],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let tool = ConversationLoader::default();
+        let out = tool
+            .call(json!({"conversation_id": conv_id.to_string(), "max_messages": 10}))
+            .await
+            .unwrap();
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["missing_message_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(out["messages"][0]["text"].as_str().unwrap(), "hello");
+
+        unsafe {
+            std::env::remove_var("UNICOS_CONVERSATIONS_DIR");
+            std::env::remove_var("UNICOS_GOD_LOG");
+        }
     }
 }

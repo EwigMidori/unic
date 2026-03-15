@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use unicos_bus::Bus;
 use unicos_common::{
-    AgentId, ChatMessage, ChatRole, Command, Envelope, Event, Message, Perception, Sender, Topic,
-    UnicError,
+    AgentId, ChatMessage, ChatRole, Command, ConversationId, Envelope, Event, Message, Perception,
+    Sender, Topic, UnicError,
 };
 use unicos_llm::LlmProvider;
 use unicos_tools::ToolRegistry;
@@ -96,10 +96,6 @@ impl DecisionEngine {
     }
 
     pub async fn decide(&self, perception: &Perception) -> Result<Option<AgentAction>, UnicError> {
-        if !self.provider.should_respond(perception).await? {
-            return Ok(None);
-        }
-
         let last = perception.recent.last().map(|m| m.payload.text.clone()).unwrap_or_default();
         if let Some(cmd) = last.strip_prefix("!bash ") {
             return Ok(Some(AgentAction::ToolCall {
@@ -118,6 +114,16 @@ impl DecisionEngine {
                 tool: "net".to_string(),
                 args: serde_json::json!({ "method": "GET", "url": url }),
             }));
+        }
+        if let Some(conv) = last.strip_prefix("!conv_load ") {
+            return Ok(Some(AgentAction::ToolCall {
+                tool: "conv_load".to_string(),
+                args: serde_json::json!({ "conversation_id": conv, "max_messages": 200 }),
+            }));
+        }
+
+        if !self.provider.should_respond(perception).await? {
+            return Ok(None);
         }
 
         let mut prompt = Vec::new();
@@ -235,20 +241,27 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn act(&self, topic: Topic, action: AgentAction) -> Result<(), UnicError> {
+    async fn act(
+        &self,
+        topic: Topic,
+        conversation_id: ConversationId,
+        action: AgentAction,
+    ) -> Result<(), UnicError> {
         match action {
             AgentAction::Speak(text) => {
-                self.bus.publish(self.bus.envelope(
+                self.bus.publish(self.bus.envelope_with_conversation(
                     topic,
                     Sender::Agent(self.cfg.id.clone()),
+                    conversation_id,
                     Event::Message(Message { text }),
                 ))?;
             }
             AgentAction::ToolCall { tool, args } => {
                 if !self.cfg.tools_enabled {
-                    self.bus.publish(self.bus.envelope(
+                    self.bus.publish(self.bus.envelope_with_conversation(
                         topic,
                         Sender::Agent(self.cfg.id.clone()),
+                        conversation_id.clone(),
                         Event::Message(Message {
                             text: format!("工具已禁用，跳过调用：{tool}"),
                         }),
@@ -256,9 +269,10 @@ impl AgentRuntime {
                     return Ok(());
                 }
                 let result = self.tools.call(&tool, args).await?;
-                self.bus.publish(self.bus.envelope(
+                self.bus.publish(self.bus.envelope_with_conversation(
                     topic,
                     Sender::Agent(self.cfg.id.clone()),
+                    conversation_id,
                     Event::Message(Message {
                         text: format!("tool:{tool} -> {}", result),
                     }),
@@ -285,7 +299,7 @@ impl AgentRuntime {
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     };
-                    let Envelope { id, ts, topic, sender, payload } = env;
+                    let Envelope { id, ts, topic, sender, conversation_id, payload } = env;
                     match payload {
                         Event::Command(cmd) => {
                             self.handle_command(cmd).await?;
@@ -308,6 +322,7 @@ impl AgentRuntime {
                                 ts,
                                 topic: topic.clone(),
                                 sender: sender.clone(),
+                                conversation_id: conversation_id.clone(),
                                 payload: msg.clone(),
                             };
                             if let Err(e) = self.mailbox.append(&env_for_mailbox).await {
@@ -319,6 +334,7 @@ impl AgentRuntime {
                                 ts,
                                 topic: topic.clone(),
                                 sender,
+                                conversation_id: conversation_id.clone(),
                                 payload: msg,
                             });
                             let soul = Self::read_soul(&self.cfg.soul_dir).await;
@@ -330,7 +346,7 @@ impl AgentRuntime {
                             };
 
                             if let Some(action) = self.decision.decide(&perception).await? {
-                                self.act(topic.clone(), action).await?;
+                                self.act(topic.clone(), conversation_id.clone(), action).await?;
                             }
                         }
                     }
@@ -358,6 +374,7 @@ mod tests {
                 ts: chrono::Utc::now(),
                 topic: Topic::new("general"),
                 sender: Sender::UserSudo,
+                conversation_id: ConversationId::default(),
                 payload: Message {
                     text: "are you there?".to_string(),
                 },
@@ -377,6 +394,7 @@ mod tests {
             ts: chrono::Utc::now(),
             topic: Topic::new("general"),
             sender: Sender::UserSudo,
+            conversation_id: ConversationId::default(),
             payload: Message {
                 text: "hello".to_string(),
             },

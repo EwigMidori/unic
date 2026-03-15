@@ -73,6 +73,46 @@ impl fmt::Display for Topic {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConversationId(String);
+
+impl ConversationId {
+    pub fn from_seed(seed: impl AsRef<str>) -> Self {
+        let seed = seed.as_ref().trim();
+        let seed = if seed.is_empty() { "default" } else { seed };
+        let input = format!("unicos:conversation:{seed}");
+        let hash = blake3::hash(input.as_bytes());
+        Self(hash.to_hex().to_string())
+    }
+
+    pub fn parse_hex(raw: impl AsRef<str>) -> Option<Self> {
+        let raw = raw.as_ref().trim();
+        if raw.len() != 64 {
+            return None;
+        }
+        if !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self(raw.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for ConversationId {
+    fn default() -> Self {
+        Self::from_seed("default")
+    }
+}
+
+impl fmt::Display for ConversationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sender {
     UserSudo,
@@ -136,6 +176,8 @@ pub struct Envelope<T> {
     pub ts: DateTime<Utc>,
     pub topic: Topic,
     pub sender: Sender,
+    #[serde(default)]
+    pub conversation_id: ConversationId,
     pub payload: T,
 }
 
@@ -146,6 +188,7 @@ impl<T> Envelope<T> {
             ts: self.ts,
             topic: self.topic,
             sender: self.sender,
+            conversation_id: self.conversation_id,
             payload: f(self.payload),
         }
     }
@@ -224,5 +267,14 @@ mod tests {
         assert_eq!(t.dm_participants(), Some(("alice", "bob")));
         let bad = Topic::new("#dm:alice");
         assert_eq!(bad.dm_participants(), None);
+    }
+
+    #[test]
+    fn conversation_id_is_stable_hex() {
+        let a = ConversationId::from_seed("task-1");
+        let b = ConversationId::from_seed("task-1");
+        assert_eq!(a, b);
+        assert_eq!(a.as_str().len(), 64);
+        assert!(ConversationId::parse_hex(a.as_str()).is_some());
     }
 }

@@ -1,7 +1,7 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,14 +11,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use unicos_agent::{AgentConfig, AgentRuntime};
 use unicos_bus::Bus;
-use unicos_common::{AgentId, Command, Envelope, Event, Message, Sender, Topic, UnicError};
+use unicos_common::{AgentId, Command, ConversationId, Envelope, Event, Message, Sender, Topic, UnicError};
 use unicos_llm::{LlmProvider, ResponsesProvider, RuleBasedProvider};
 use unicos_tools::ToolRegistry;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PathsConfig {
     pub unics_dir: PathBuf,
     pub god_log: PathBuf,
+    pub conversations_dir: PathBuf,
 }
 
 impl Default for PathsConfig {
@@ -26,6 +28,7 @@ impl Default for PathsConfig {
         Self {
             unics_dir: PathBuf::from("/etc/unicos/unics"),
             god_log: PathBuf::from("/var/lib/unicos/god.log"),
+            conversations_dir: PathBuf::from("/var/lib/unicos/conversations"),
         }
     }
 }
@@ -129,6 +132,12 @@ impl Config {
             let s = v.to_string_lossy().trim().to_string();
             if !s.is_empty() {
                 self.paths.god_log = PathBuf::from(s);
+            }
+        }
+        if let Some(v) = env::var_os("UNICOS_CONVERSATIONS_DIR") {
+            let s = v.to_string_lossy().trim().to_string();
+            if !s.is_empty() {
+                self.paths.conversations_dir = PathBuf::from(s);
             }
         }
     }
@@ -261,6 +270,96 @@ impl FsWatcher {
 pub struct FsEvent {
     pub kind: String,
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConversationFile {
+    conversation_id: ConversationId,
+    message_ids: Vec<Uuid>,
+}
+
+struct ConversationState {
+    file: ConversationFile,
+    seen: HashSet<Uuid>,
+}
+
+pub struct ConversationAggregator {
+    dir: PathBuf,
+}
+
+impl ConversationAggregator {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path_for(&self, id: &ConversationId) -> PathBuf {
+        self.dir.join(format!("{}.json", id.as_str()))
+    }
+
+    async fn load_state(&self, id: &ConversationId) -> Option<ConversationState> {
+        let path = self.path_for(id);
+        let s = tokio::fs::read_to_string(&path).await.ok()?;
+        let file: ConversationFile = serde_json::from_str(&s).ok()?;
+        let seen = file.message_ids.iter().cloned().collect::<HashSet<_>>();
+        Some(ConversationState { file, seen })
+    }
+
+    async fn persist(&self, file: &ConversationFile) {
+        if let Err(e) = tokio::fs::create_dir_all(&self.dir).await {
+            error!("conversation aggregator: create dir failed: {e}");
+            return;
+        }
+        let path = self.path_for(&file.conversation_id);
+        let tmp = path.with_extension("json.tmp");
+        let Ok(json) = serde_json::to_string_pretty(file) else { return };
+        if tokio::fs::write(&tmp, json).await.is_err() {
+            return;
+        }
+        let _ = tokio::fs::rename(&tmp, &path).await;
+    }
+
+    pub fn spawn(
+        self,
+        mut rx: broadcast::Receiver<Envelope<Event>>,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut states: HashMap<ConversationId, ConversationState> = HashMap::new();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    msg = rx.recv() => {
+                        let env = match msg {
+                            Ok(v) => v,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        };
+                        if !matches!(env.payload, Event::Message(_)) {
+                            continue;
+                        }
+
+                        let conv_id = env.conversation_id.clone();
+                        if !states.contains_key(&conv_id) {
+                            let st = self
+                                .load_state(&conv_id)
+                                .await
+                                .unwrap_or_else(|| ConversationState {
+                                    file: ConversationFile { conversation_id: conv_id.clone(), message_ids: Vec::new() },
+                                    seen: HashSet::new(),
+                                });
+                            states.insert(conv_id.clone(), st);
+                        }
+
+                        let st = states.get_mut(&conv_id).expect("state must exist");
+                        if st.seen.insert(env.id) {
+                            st.file.message_ids.push(env.id);
+                            self.persist(&st.file).await;
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 pub struct Orchestrator {
@@ -546,6 +645,11 @@ Rules:
         GodLogger::new(self.cfg.paths.god_log.clone()).spawn(self.bus.subscribe(), self.cancel.clone())
     }
 
+    pub fn spawn_conversation_aggregator(&self) -> JoinHandle<()> {
+        ConversationAggregator::new(self.cfg.paths.conversations_dir.clone())
+            .spawn(self.bus.subscribe(), self.cancel.clone())
+    }
+
     pub async fn run(self) -> Result<(), UnicError> {
         self.run_with_fs_watch(true).await
     }
@@ -662,6 +766,7 @@ mod tests {
         unsafe {
             std::env::remove_var("UNICOS_UNICS_DIR");
             std::env::remove_var("UNICOS_GOD_LOG");
+            std::env::remove_var("UNICOS_CONVERSATIONS_DIR");
         }
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.toml");
@@ -703,13 +808,19 @@ tools_enabled = false
         unsafe {
             std::env::set_var("UNICOS_UNICS_DIR", "/tmp/unicos-env-unics");
             std::env::set_var("UNICOS_GOD_LOG", "/tmp/unicos-env-god.log");
+            std::env::set_var("UNICOS_CONVERSATIONS_DIR", "/tmp/unicos-env-conversations");
         }
         let cfg = Config::load_or_default(&p).await.unwrap();
         assert_eq!(cfg.paths.unics_dir, PathBuf::from("/tmp/unicos-env-unics"));
         assert_eq!(cfg.paths.god_log, PathBuf::from("/tmp/unicos-env-god.log"));
+        assert_eq!(
+            cfg.paths.conversations_dir,
+            PathBuf::from("/tmp/unicos-env-conversations")
+        );
         unsafe {
             std::env::remove_var("UNICOS_UNICS_DIR");
             std::env::remove_var("UNICOS_GOD_LOG");
+            std::env::remove_var("UNICOS_CONVERSATIONS_DIR");
         }
     }
 
@@ -782,5 +893,52 @@ tools_enabled = false
         assert!(!tokio::fs::try_exists(&soul_dir).await.unwrap());
 
         orch.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn conversations_aggregate_message_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv_dir = dir.path().join("conversations");
+
+        let bus = Bus::new(16);
+        let cancel = CancellationToken::new();
+        let _task = ConversationAggregator::new(conv_dir.clone()).spawn(bus.subscribe(), cancel.clone());
+
+        let conv_id = ConversationId::from_seed("task-1");
+        let env = bus.envelope_with_conversation(
+            Topic::new("general"),
+            Sender::UserSudo,
+            conv_id.clone(),
+            Event::Message(Message { text: "hi".to_string() }),
+        );
+        let msg_id = env.id;
+        bus.publish(env).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let path = conv_dir.join(format!("{}.json", conv_id.as_str()));
+        let s = tokio::fs::read_to_string(&path).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let ids = v["message_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].as_str().unwrap(), msg_id.to_string());
+
+        // No duplicates.
+        let env2 = Envelope {
+            id: msg_id,
+            ts: chrono::Utc::now(),
+            topic: Topic::new("general"),
+            sender: Sender::UserSudo,
+            conversation_id: conv_id.clone(),
+            payload: Event::Message(Message { text: "hi".to_string() }),
+        };
+        bus.publish(env2).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = tokio::fs::read_to_string(&path).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let ids = v["message_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+
+        cancel.cancel();
     }
 }

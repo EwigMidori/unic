@@ -1,4 +1,4 @@
-use crate::{Command, Envelope, Event, Sender, Topic};
+use crate::{Command, ConversationId, Envelope, Event, Sender, Topic};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -11,6 +11,7 @@ pub enum ClientRequest {
         text: String,
         #[serde(default)]
         sender: Sender,
+        conversation_id: ConversationId,
     },
     Command { cmd: Command },
 }

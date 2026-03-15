@@ -1,6 +1,7 @@
 ## paths via env:
 # export UNICOS_UNICS_DIR=/etc/unicos/unics
 # export UNICOS_GOD_LOG=/var/lib/unicos/god.log
+# export UNICOS_CONVERSATIONS_DIR=/var/lib/unicos/conversations
 
 [daemon]
 socket_path = "/tmp/unicos.sock"

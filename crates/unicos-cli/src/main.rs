@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::warn;
 use unicos_common::ipc::{ClientRequest, ServerMessage};
-use unicos_common::{AgentId, Command, Envelope, Event, Message, Sender, Topic};
+use unicos_common::{AgentId, Command, ConversationId, Envelope, Event, Message, Sender, Topic};
 
 fn parse_args() -> String {
     let mut socket = "/tmp/unicos.sock".to_string();
@@ -38,11 +38,16 @@ struct CompletionState {
     active_agents: BTreeSet<String>,
     known_agents: BTreeSet<String>,
     topics: BTreeSet<String>,
+    conversations: BTreeSet<String>,
 }
 
 impl CompletionState {
     fn note_topic(&mut self, topic: &Topic) {
         self.topics.insert(topic.to_string());
+    }
+
+    fn note_conversation(&mut self, id: &ConversationId) {
+        self.conversations.insert(id.to_string());
     }
 
     fn note_agent_spawned(&mut self, id: &AgentId) {
@@ -79,6 +84,10 @@ impl CompletionState {
         }
         out
     }
+
+    fn conversation_suggestions(&self) -> Vec<String> {
+        self.conversations.iter().cloned().collect::<Vec<_>>()
+    }
 }
 
 fn format_event(env: Envelope<Event>) -> Option<String> {
@@ -98,12 +107,14 @@ fn format_event(env: Envelope<Event>) -> Option<String> {
 #[derive(Clone)]
 struct UnicosPrompt {
     topic: Arc<Mutex<String>>,
+    conv: Arc<Mutex<String>>,
 }
 
 impl Prompt for UnicosPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         let t = self.topic.lock().unwrap();
-        Cow::Owned(format!("{t} "))
+        let c = self.conv.lock().unwrap();
+        Cow::Owned(format!("{t} {c} "))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -195,6 +206,7 @@ impl UnicosCompleter {
                 ("/agents", "list running agents"),
                 ("/topic", "switch current topic"),
                 ("/dm", "switch to dm with agent"),
+                ("/conv", "switch current conversation"),
                 ("/spawn", "spawn agent"),
                 ("/kill", "kill agent"),
                 ("/purge", "delete agent on disk (needs confirm)"),
@@ -308,10 +320,33 @@ impl Completer for UnicosCompleter {
                 }
                 return out;
             }
+
+            let completing_conversation = matches!(cmd, "/conv") && arg_index == 1;
+            if completing_conversation {
+                let convs = self.state.lock().unwrap().conversation_suggestions();
+                for c in convs {
+                    if c.starts_with(prefix) || prefix.is_empty() {
+                        out.push(Suggestion {
+                            value: c,
+                            description: Some("conversation".to_string()),
+                            span,
+                            append_whitespace: true,
+                            ..Suggestion::default()
+                        });
+                    }
+                }
+                return out;
+            }
         }
 
         out
     }
+}
+
+fn short_conv(id: &ConversationId) -> String {
+    let s = id.as_str();
+    let short = s.get(0..8).unwrap_or(s);
+    format!("c:{short}")
 }
 
 fn add_completion_keybindings(keybindings: &mut Keybindings) {
@@ -342,6 +377,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let current_topic = Arc::new(Mutex::new(Topic::new("general")));
     let prompt_topic = Arc::new(Mutex::new("#general".to_string()));
+    let current_conversation = Arc::new(Mutex::new(ConversationId::default()));
+    let prompt_conv = Arc::new(Mutex::new(short_conv(&ConversationId::default())));
     let completion_state = Arc::new(Mutex::new(CompletionState::default()));
 
     let printer = ExternalPrinter::default();
@@ -364,6 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         let mut st = completion_state_for_server.lock().unwrap();
                         st.note_topic(&envelope.topic);
+                        st.note_conversation(&envelope.conversation_id);
                         if let Event::SystemNotification(ref n) = envelope.payload {
                             match n {
                                 unicos_common::SystemNotification::AgentSpawned { id } => st.note_agent_spawned(id),
@@ -398,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let prompt = UnicosPrompt {
         topic: Arc::clone(&prompt_topic),
+        conv: Arc::clone(&prompt_conv),
     };
 
     let completion_state_for_editor = Arc::clone(&completion_state);
@@ -457,10 +496,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 write_half.write_all(b"\n").await?;
 
+                let conv = { current_conversation.lock().unwrap().clone() };
                 let req = ClientRequest::Publish {
                     topic: dm_topic,
                     text: msg.to_string(),
                     sender: Sender::UserSudo,
+                    conversation_id: conv,
                 };
                 write_half
                     .write_all(serde_json::to_string(&req)?.as_bytes())
@@ -572,6 +613,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let _ = printer_for_cli.print(format!("switched topic: {t}"));
                 }
+                ["conv"] => {
+                    let conv = current_conversation.lock().unwrap().clone();
+                    let _ = printer_for_cli.print(format!("conversation_id: {conv}"));
+                }
+                ["conv", seed_or_id] => {
+                    let next = ConversationId::parse_hex(*seed_or_id)
+                        .unwrap_or_else(|| ConversationId::from_seed(*seed_or_id));
+                    {
+                        let mut cur = current_conversation.lock().unwrap();
+                        *cur = next.clone();
+                    }
+                    {
+                        let mut pc = prompt_conv.lock().unwrap();
+                        *pc = short_conv(&next);
+                    }
+                    {
+                        let mut st = completion_state.lock().unwrap();
+                        st.note_conversation(&next);
+                    }
+                    let _ = printer_for_cli.print(format!("switched conversation_id: {next}"));
+                }
                 ["dm", peer] => {
                     let dm_topic = Topic::dm(user_dm_id(), *peer);
                     {
@@ -628,10 +690,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let topic = { current_topic.lock().unwrap().clone() };
+        let conv = { current_conversation.lock().unwrap().clone() };
         let req = ClientRequest::Publish {
             topic,
             text: line,
             sender: Sender::UserSudo,
+            conversation_id: conv,
         };
         write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
