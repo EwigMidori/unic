@@ -3,6 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use unicos_bus::Bus;
@@ -32,6 +33,37 @@ pub enum AgentAction {
 pub struct ContextManager {
     window: usize,
     recent: VecDeque<Envelope<Message>>,
+}
+
+struct MailboxLogger {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+}
+
+impl MailboxLogger {
+    fn new(path: PathBuf) -> Self {
+        Self { path, file: None }
+    }
+
+    async fn append(&mut self, env: &Envelope<Message>) -> Result<(), UnicError> {
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .await?;
+            self.file = Some(file);
+        }
+
+        let line = serde_json::to_string(env)?;
+        let f = self.file.as_mut().expect("mailbox file must be open");
+        f.write_all(line.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        Ok(())
+    }
 }
 
 impl ContextManager {
@@ -123,6 +155,7 @@ pub struct AgentRuntime {
     sleeping: bool,
     subscribed: HashSet<Topic>,
     ctx: ContextManager,
+    mailbox: MailboxLogger,
 }
 
 impl AgentRuntime {
@@ -137,6 +170,7 @@ impl AgentRuntime {
         for t in &cfg.topics {
             subscribed.insert(t.clone());
         }
+        let mailbox = MailboxLogger::new(cfg.soul_dir.join("mailbox.log"));
         Self {
             rx: bus.subscribe(),
             decision: DecisionEngine::new(provider),
@@ -147,6 +181,7 @@ impl AgentRuntime {
             cancel,
             sleeping: false,
             subscribed,
+            mailbox,
         }
     }
 
@@ -268,6 +303,17 @@ impl AgentRuntime {
                                 continue;
                             }
 
+                            let env_for_mailbox = Envelope {
+                                id,
+                                ts,
+                                topic: topic.clone(),
+                                sender: sender.clone(),
+                                payload: msg.clone(),
+                            };
+                            if let Err(e) = self.mailbox.append(&env_for_mailbox).await {
+                                warn!("agent {} mailbox append failed: {e}", self.cfg.id);
+                            }
+
                             self.ctx.push_message(Envelope {
                                 id,
                                 ts,
@@ -319,5 +365,25 @@ mod tests {
         };
         let action = engine.decide(&perception).await.unwrap();
         assert!(matches!(action, Some(AgentAction::Speak(_))));
+    }
+
+    #[tokio::test]
+    async fn mailbox_appends_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.log");
+        let mut m = MailboxLogger::new(path.clone());
+        let env = Envelope {
+            id: uuid::Uuid::now_v7(),
+            ts: chrono::Utc::now(),
+            topic: Topic::new("general"),
+            sender: Sender::UserSudo,
+            payload: Message {
+                text: "hello".to_string(),
+            },
+        };
+        m.append(&env).await.unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("\"hello\""));
+        assert!(content.lines().count() >= 1);
     }
 }
