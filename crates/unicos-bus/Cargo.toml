@@ -1,0 +1,13 @@
+[package]
+name = "unicos-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+unicos-common = { path = "../unicos-common" }

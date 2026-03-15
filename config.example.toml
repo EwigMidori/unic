@@ -1,0 +1,26 @@
+## paths via env:
+# export UNICOS_UNICS_DIR=/etc/unicos/unics
+# export UNICOS_GOD_LOG=/var/lib/unicos/god.log
+
+[daemon]
+socket_path = "/tmp/unicos.sock"
+
+[bus]
+capacity = 1024
+
+[agent]
+perception_window = 40
+default_topics = ["#general"]
+tools_enabled = true
+
+[llm]
+# rule_based | responses
+provider = "responses"
+model = "gpt-5.2"
+
+[llm.responses]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# api_key = ""
+# timeout_ms = 60000
+# retries = 2
