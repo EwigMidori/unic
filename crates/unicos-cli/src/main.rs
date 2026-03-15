@@ -28,6 +28,10 @@ fn parse_args() -> String {
     socket
 }
 
+fn user_dm_id() -> &'static str {
+    "sudo"
+}
+
 fn format_event(env: Envelope<Event>) -> Option<String> {
     match env.payload {
         Event::Message(Message { text }) => Some(format!(
@@ -87,6 +91,7 @@ impl Highlighter for UnicosHighlighter {
             .bold();
         let topic_style = nu_ansi_term::Style::new().fg(nu_ansi_term::Color::LightBlue);
         let bang_style = nu_ansi_term::Style::new().fg(nu_ansi_term::Color::Yellow);
+        let dm_style = nu_ansi_term::Style::new().fg(nu_ansi_term::Color::Purple);
 
         let trimmed = line.trim_start();
         if trimmed.starts_with('/') {
@@ -104,6 +109,14 @@ impl Highlighter for UnicosHighlighter {
                 .map(|i| leading_ws + i)
                 .unwrap_or(line.len());
             out.style_range(leading_ws, end, bang_style);
+        }
+        if trimmed.starts_with('@') {
+            let leading_ws = line.len() - trimmed.len();
+            let end = trimmed
+                .find(char::is_whitespace)
+                .map(|i| leading_ws + i)
+                .unwrap_or(line.len());
+            out.style_range(leading_ws, end, dm_style);
         }
 
         for (idx, _) in line.match_indices('#') {
@@ -131,6 +144,7 @@ impl Default for UnicosCompleter {
             commands: vec![
                 ("/ping", "daemon connectivity"),
                 ("/topic", "switch current topic"),
+                ("/dm", "switch to dm with agent"),
                 ("/spawn", "spawn agent"),
                 ("/kill", "kill agent"),
                 ("/join", "agent join topic"),
@@ -314,6 +328,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     warn!("Connected to {socket}. Use /spawn /kill /join /sleep /wake /topic; plain text sends to current topic.");
 
     while let Some(line) = input_rx.recv().await {
+        if let Some(rest) = line.strip_prefix('@') {
+            let mut it = rest.splitn(2, char::is_whitespace);
+            let peer = it.next().unwrap_or("").trim();
+            let msg = it.next().unwrap_or("").trim();
+            if !peer.is_empty() && !msg.is_empty() {
+                let dm_topic = Topic::dm(user_dm_id(), peer);
+                let join = ClientRequest::Command {
+                    cmd: Command::JoinTopic {
+                        id: AgentId::new(peer),
+                        topic: dm_topic.clone(),
+                    },
+                };
+                write_half
+                    .write_all(serde_json::to_string(&join)?.as_bytes())
+                    .await?;
+                write_half.write_all(b"\n").await?;
+
+                let req = ClientRequest::Publish {
+                    topic: dm_topic,
+                    text: msg.to_string(),
+                    sender: Sender::UserSudo,
+                };
+                write_half
+                    .write_all(serde_json::to_string(&req)?.as_bytes())
+                    .await?;
+                write_half.write_all(b"\n").await?;
+                continue;
+            }
+        }
+
         if let Some(rest) = line.strip_prefix('/') {
             let parts = rest.split_whitespace().collect::<Vec<_>>();
             match parts.as_slice() {
@@ -378,6 +422,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pt = prompt_topic.lock().unwrap();
                         *pt = t.to_string();
                     }
+                }
+                ["dm", peer] => {
+                    let dm_topic = Topic::dm(user_dm_id(), *peer);
+                    {
+                        let mut cur = current_topic.lock().unwrap();
+                        *cur = dm_topic.clone();
+                    }
+                    {
+                        let mut pt = prompt_topic.lock().unwrap();
+                        *pt = dm_topic.to_string();
+                    }
+
+                    let join = ClientRequest::Command {
+                        cmd: Command::JoinTopic {
+                            id: AgentId::new(*peer),
+                            topic: dm_topic,
+                        },
+                    };
+                    write_half
+                        .write_all(serde_json::to_string(&join)?.as_bytes())
+                        .await?;
+                    write_half.write_all(b"\n").await?;
                 }
                 _ => {}
             }

@@ -37,6 +37,31 @@ impl Topic {
         }
     }
 
+    pub fn dm(a: impl AsRef<str>, b: impl AsRef<str>) -> Self {
+        let a = a.as_ref().trim();
+        let b = b.as_ref().trim();
+        let (x, y) = if a <= b { (a, b) } else { (b, a) };
+        Topic::new(format!("dm:{x}:{y}"))
+    }
+
+    pub fn is_dm(&self) -> bool {
+        self.0.starts_with("#dm:")
+    }
+
+    pub fn dm_participants(&self) -> Option<(&str, &str)> {
+        if !self.is_dm() {
+            return None;
+        }
+        let rest = self.0.strip_prefix("#dm:")?;
+        let mut it = rest.splitn(3, ':');
+        let a = it.next()?;
+        let b = it.next()?;
+        if a.is_empty() || b.is_empty() {
+            return None;
+        }
+        Some((a, b))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -172,4 +197,30 @@ pub enum UnicError {
 
     #[error("notify error: {0}")]
     Notify(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dm_topic_is_normalized() {
+        assert_eq!(
+            Topic::dm("bob", "alice").as_str(),
+            "#dm:alice:bob"
+        );
+        assert_eq!(
+            Topic::dm("sudo", "Pinger").as_str(),
+            "#dm:Pinger:sudo"
+        );
+    }
+
+    #[test]
+    fn dm_participants_parses() {
+        let t = Topic::new("#dm:alice:bob");
+        assert!(t.is_dm());
+        assert_eq!(t.dm_participants(), Some(("alice", "bob")));
+        let bad = Topic::new("#dm:alice");
+        assert_eq!(bad.dm_participants(), None);
+    }
 }

@@ -423,7 +423,22 @@ impl Orchestrator {
         match cmd {
             Command::Spawn { id } => self.spawn_agent(id).await?,
             Command::Kill { id } => self.kill_agent(id).await?,
-            Command::JoinTopic { .. } | Command::Sleep { .. } | Command::Wake { .. } => {
+            Command::JoinTopic { ref id, ref topic } => {
+                if topic.is_dm() {
+                    let Some((a, b)) = topic.dm_participants() else {
+                        return Ok(());
+                    };
+                    if id.as_str() != a && id.as_str() != b {
+                        return Ok(());
+                    }
+                }
+                self.bus.publish(self.bus.envelope(
+                    Topic::new("system"),
+                    Sender::System,
+                    Event::Command(cmd),
+                ))?;
+            }
+            Command::Sleep { .. } | Command::Wake { .. } => {
                 self.bus.publish(self.bus.envelope(
                     Topic::new("system"),
                     Sender::System,

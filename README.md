@@ -30,12 +30,14 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 
 - 普通输入：向当前 topic 发言（默认 `#general`）
 - 管理命令（以 `/` 开头）：
+  - `/dm <AgentId>`（切到与该 Agent 的私聊 topic，并让它 join）
   - `/topic <name>`
   - `/spawn <AgentId>`
   - `/kill <AgentId>`
   - `/join <AgentId> <topic>`
   - `/sleep <AgentId>`
   - `/wake <AgentId>`
+  - `@<AgentId> <text>`（不切 topic，直接发私聊）
 
 ## Agent 灵魂区
 
