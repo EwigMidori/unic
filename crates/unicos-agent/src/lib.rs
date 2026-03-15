@@ -496,7 +496,7 @@ impl AgentRuntime {
                                         // Back-compat: treat direct speak as say.
                                         self.publish_say(&topic, &conversation_id, serde_json::json!({ "text": text }))?;
                                         trace.push(ChatMessage { role: ChatRole::Tool, content: "{\"sent\":true}".to_string(), name: Some("say".to_string()) });
-                                        continue;
+                                        break;
                                     }
                                     AgentAction::ToolCall { tool, args } => {
                                         steps += 1;
@@ -508,7 +508,7 @@ impl AgentRuntime {
                                                 content: "{\"sent\":true}".to_string(),
                                                 name: Some("say".to_string()),
                                             });
-                                            continue;
+                                            break;
                                         }
 
                                         if !self.cfg.tools_enabled {
