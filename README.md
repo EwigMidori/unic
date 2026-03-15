@@ -49,7 +49,7 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 
 `/spawn <AgentId>` 会在该目录下自动生成默认的 `soul.md` 与 `config.json`（若不存在）。
 
-每个 Agent 还会维护一个 `mailbox.log`（JSONL），记录它“实际接收并进入感知”的所有消息。
+每个 Agent 还会维护一个 `history.log`（JSONL），按时间顺序记录该 Agent 收到与发出的所有消息（并包含工具调用记录）。
 
 ## Conversations（会话聚合）
 

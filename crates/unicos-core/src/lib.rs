@@ -597,11 +597,11 @@ Rules:
             Err(e) => return Err(e.into()),
         }
 
-        let mailbox = soul_dir.join("mailbox.log");
-        match tokio::fs::metadata(&mailbox).await {
+        let history = soul_dir.join("history.log");
+        match tokio::fs::metadata(&history).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::write(&mailbox, "").await?;
+                tokio::fs::write(&history, "").await?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -846,7 +846,7 @@ tools_enabled = false
         assert!(tokio::fs::try_exists(soul_dir.join("config.json"))
             .await
             .unwrap());
-        assert!(tokio::fs::try_exists(soul_dir.join("mailbox.log"))
+        assert!(tokio::fs::try_exists(soul_dir.join("history.log"))
             .await
             .unwrap());
 

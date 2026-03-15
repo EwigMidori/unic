@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use unicos_bus::Bus;
 use unicos_common::{
-    AgentId, ChatMessage, ChatRole, Command, Envelope, Event, Message, Perception,
+    AgentId, ChatMessage, ChatRole, Command, ConversationId, Envelope, Event, Message, Perception,
     Sender, Topic, UnicError,
 };
 use unicos_llm::LlmProvider;
@@ -56,17 +57,39 @@ pub struct ContextManager {
     recent: VecDeque<Envelope<Message>>,
 }
 
-struct MailboxLogger {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HistoryEntry {
+    Inbound { envelope: Envelope<Event> },
+    Outbound { envelope: Envelope<Event> },
+    ToolCall {
+        ts: DateTime<Utc>,
+        topic: Topic,
+        conversation_id: ConversationId,
+        tool: String,
+        args: Value,
+    },
+    ToolResult {
+        ts: DateTime<Utc>,
+        topic: Topic,
+        conversation_id: ConversationId,
+        tool: String,
+        ok: bool,
+        result: Value,
+    },
+}
+
+struct HistoryLogger {
     path: PathBuf,
     file: Option<tokio::fs::File>,
 }
 
-impl MailboxLogger {
+impl HistoryLogger {
     fn new(path: PathBuf) -> Self {
         Self { path, file: None }
     }
 
-    async fn append(&mut self, env: &Envelope<Message>) -> Result<(), UnicError> {
+    async fn append(&mut self, entry: &HistoryEntry) -> Result<(), UnicError> {
         if self.file.is_none() {
             if let Some(parent) = self.path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -79,8 +102,8 @@ impl MailboxLogger {
             self.file = Some(file);
         }
 
-        let line = serde_json::to_string(env)?;
-        let f = self.file.as_mut().expect("mailbox file must be open");
+        let line = serde_json::to_string(entry)?;
+        let f = self.file.as_mut().expect("history file must be open");
         f.write_all(line.as_bytes()).await?;
         f.write_all(b"\n").await?;
         Ok(())
@@ -260,7 +283,7 @@ pub struct AgentRuntime {
     sleeping: bool,
     subscribed: HashSet<Topic>,
     ctx: ContextManager,
-    mailbox: MailboxLogger,
+    history: HistoryLogger,
 }
 
 impl AgentRuntime {
@@ -275,7 +298,7 @@ impl AgentRuntime {
         for t in &cfg.topics {
             subscribed.insert(t.clone());
         }
-        let mailbox = MailboxLogger::new(cfg.soul_dir.join("mailbox.log"));
+        let history = HistoryLogger::new(cfg.soul_dir.join("history.log"));
         Self {
             rx: bus.subscribe(),
             decision: DecisionEngine::new(provider),
@@ -286,7 +309,7 @@ impl AgentRuntime {
             cancel,
             sleeping: false,
             subscribed,
-            mailbox,
+            history,
         }
     }
 
@@ -342,12 +365,26 @@ impl AgentRuntime {
         args
     }
 
-    fn publish_say(
-        &self,
+    async fn publish_say(
+        &mut self,
         topic: &Topic,
         conversation_id: &unicos_common::ConversationId,
         args: Value,
     ) -> Result<Vec<String>, UnicError> {
+        if let Err(e) = self
+            .history
+            .append(&HistoryEntry::ToolCall {
+                ts: Utc::now(),
+                topic: topic.clone(),
+                conversation_id: conversation_id.clone(),
+                tool: "say".to_string(),
+                args: args.clone(),
+            })
+            .await
+        {
+            warn!("agent {} history append failed (tool_call say): {e}", self.cfg.id);
+        }
+
         let parsed: SayArgs = serde_json::from_value(args).unwrap_or(SayArgs {
             text: None,
             messages: None,
@@ -366,6 +403,17 @@ impl AgentRuntime {
             }
         }
         if msgs.is_empty() {
+            let _ = self
+                .history
+                .append(&HistoryEntry::ToolResult {
+                    ts: Utc::now(),
+                    topic: topic.clone(),
+                    conversation_id: conversation_id.clone(),
+                    tool: "say".to_string(),
+                    ok: true,
+                    result: serde_json::json!({ "published": [] }),
+                })
+                .await;
             return Ok(Vec::new());
         }
         let mut published = Vec::new();
@@ -374,13 +422,28 @@ impl AgentRuntime {
                 continue;
             }
             published.push(text.clone());
-            self.bus.publish(self.bus.envelope_with_conversation(
+            let env = self.bus.envelope_with_conversation(
                 topic.clone(),
                 Sender::Agent(self.cfg.id.clone()),
                 conversation_id.clone(),
                 Event::Message(Message { text }),
-            ))?;
+            );
+            self.bus.publish(env.clone())?;
+            if let Err(e) = self.history.append(&HistoryEntry::Outbound { envelope: env }).await {
+                warn!("agent {} history append failed (outbound): {e}", self.cfg.id);
+            }
         }
+        let _ = self
+            .history
+            .append(&HistoryEntry::ToolResult {
+                ts: Utc::now(),
+                topic: topic.clone(),
+                conversation_id: conversation_id.clone(),
+                tool: "say".to_string(),
+                ok: true,
+                result: serde_json::json!({ "published": published }),
+            })
+            .await;
         Ok(published)
     }
 
@@ -457,16 +520,22 @@ impl AgentRuntime {
                                 continue;
                             }
 
-                            let env_for_mailbox = Envelope {
+                            let inbound_env = Envelope {
                                 id,
                                 ts,
                                 topic: topic.clone(),
                                 sender: sender.clone(),
                                 conversation_id: conversation_id.clone(),
-                                payload: msg.clone(),
+                                payload: Event::Message(msg.clone()),
                             };
-                            if let Err(e) = self.mailbox.append(&env_for_mailbox).await {
-                                warn!("agent {} mailbox append failed: {e}", self.cfg.id);
+                            if let Err(e) = self
+                                .history
+                                .append(&HistoryEntry::Inbound {
+                                    envelope: inbound_env,
+                                })
+                                .await
+                            {
+                                warn!("agent {} history append failed (inbound): {e}", self.cfg.id);
                             }
 
                             self.ctx.push_message(Envelope {
@@ -490,13 +559,15 @@ impl AgentRuntime {
                             let max_steps = 6usize;
                             loop {
                                 if steps >= max_steps {
-                                    let _ = self.publish_say(
+                                    let _ = self
+                                        .publish_say(
                                         &topic,
                                         &conversation_id,
                                         serde_json::json!({
                                             "text": "工具调用回合数超限，已停止（请缩小任务或指定更明确的命令）。",
                                         }),
-                                    )?;
+                                    )
+                                        .await?;
                                     break;
                                 }
 
@@ -506,11 +577,13 @@ impl AgentRuntime {
                                 match action {
                                     AgentAction::Speak(text) => {
                                         // Back-compat: treat direct speak as say.
-                                        let published = self.publish_say(
+                                        let published = self
+                                            .publish_say(
                                             &topic,
                                             &conversation_id,
                                             serde_json::json!({ "text": text }),
-                                        )?;
+                                        )
+                                            .await?;
                                         trace.push(ChatMessage {
                                             role: ChatRole::Tool,
                                             content: serde_json::json!({
@@ -525,7 +598,9 @@ impl AgentRuntime {
                                         steps += 1;
 
                                         if tool == "say" {
-                                            let published = self.publish_say(&topic, &conversation_id, args)?;
+                                            let published = self
+                                                .publish_say(&topic, &conversation_id, args)
+                                                .await?;
                                             trace.push(ChatMessage {
                                                 role: ChatRole::Tool,
                                                 content: serde_json::json!({
@@ -538,6 +613,21 @@ impl AgentRuntime {
                                         }
 
                                         if !self.cfg.tools_enabled {
+                                            let _ = self.history.append(&HistoryEntry::ToolCall {
+                                                ts: Utc::now(),
+                                                topic: topic.clone(),
+                                                conversation_id: conversation_id.clone(),
+                                                tool: tool.clone(),
+                                                args: args.clone(),
+                                            }).await;
+                                            let _ = self.history.append(&HistoryEntry::ToolResult {
+                                                ts: Utc::now(),
+                                                topic: topic.clone(),
+                                                conversation_id: conversation_id.clone(),
+                                                tool: tool.clone(),
+                                                ok: false,
+                                                result: serde_json::json!({ "error": "tools disabled" }),
+                                            }).await;
                                             trace.push(ChatMessage {
                                                 role: ChatRole::Tool,
                                                 content: "ERROR: tools disabled".to_string(),
@@ -547,13 +637,42 @@ impl AgentRuntime {
                                         }
 
                                         let args = self.rewrite_tool_args_for_home(&tool, args);
+                                        if let Err(e) = self.history.append(&HistoryEntry::ToolCall {
+                                            ts: Utc::now(),
+                                            topic: topic.clone(),
+                                            conversation_id: conversation_id.clone(),
+                                            tool: tool.clone(),
+                                            args: args.clone(),
+                                        }).await {
+                                            warn!("agent {} history append failed (tool_call {tool}): {e}", self.cfg.id);
+                                        }
                                         let tool_result = self.tools.call(&tool, args).await;
                                         let trace_msg = match tool_result {
                                             Ok(v) => {
+                                                if let Err(e) = self.history.append(&HistoryEntry::ToolResult {
+                                                    ts: Utc::now(),
+                                                    topic: topic.clone(),
+                                                    conversation_id: conversation_id.clone(),
+                                                    tool: tool.clone(),
+                                                    ok: true,
+                                                    result: v.clone(),
+                                                }).await {
+                                                    warn!("agent {} history append failed (tool_result {tool} ok): {e}", self.cfg.id);
+                                                }
                                                 let s = serde_json::to_string(&v).unwrap_or_else(|_| "\"<non-json>\"".to_string());
                                                 ChatMessage { role: ChatRole::Tool, content: s, name: Some(tool.clone()) }
                                             }
                                             Err(e) => {
+                                                if let Err(he) = self.history.append(&HistoryEntry::ToolResult {
+                                                    ts: Utc::now(),
+                                                    topic: topic.clone(),
+                                                    conversation_id: conversation_id.clone(),
+                                                    tool: tool.clone(),
+                                                    ok: false,
+                                                    result: serde_json::json!({ "error": e.to_string() }),
+                                                }).await {
+                                                    warn!("agent {} history append failed (tool_result {tool} err): {he}", self.cfg.id);
+                                                }
                                                 ChatMessage { role: ChatRole::Tool, content: format!("ERROR: {e}"), name: Some(tool.clone()) }
                                             }
                                         };
@@ -601,23 +720,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mailbox_appends_jsonl() {
+    async fn history_appends_jsonl() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mailbox.log");
-        let mut m = MailboxLogger::new(path.clone());
+        let path = dir.path().join("history.log");
+        let mut h = HistoryLogger::new(path.clone());
         let env = Envelope {
             id: uuid::Uuid::now_v7(),
             ts: chrono::Utc::now(),
             topic: Topic::new("general"),
             sender: Sender::UserSudo,
             conversation_id: ConversationId::default(),
-            payload: Message {
+            payload: Event::Message(Message {
                 text: "hello".to_string(),
-            },
+            }),
         };
-        m.append(&env).await.unwrap();
+        h.append(&HistoryEntry::Inbound { envelope: env }).await.unwrap();
+        h.append(&HistoryEntry::ToolCall {
+            ts: chrono::Utc::now(),
+            topic: Topic::new("general"),
+            conversation_id: ConversationId::default(),
+            tool: "bash".to_string(),
+            args: serde_json::json!({ "cmd": "ls" }),
+        })
+        .await
+        .unwrap();
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("\"hello\""));
+        assert!(content.contains("\"tool\":\"bash\""));
         assert!(content.lines().count() >= 1);
     }
 }
