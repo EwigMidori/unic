@@ -111,6 +111,8 @@ impl DecisionEngine {
     fn tool_protocol_system_prompt() -> String {
         [
             "You are an autonomous agent running inside UnicOS.",
+            "IMPORTANT: Tool calls and tool outputs are PRIVATE to you. Other participants will NOT see them.",
+            "After using any tool, you MUST send a normal speak message that includes the relevant results (a short, user-facing summary and key output lines).",
             "You can think silently, but you MUST output ONLY a single JSON object as your final output.",
             "Valid actions:",
             r#"  - {"action":"speak","text":"..."}"#,
@@ -121,6 +123,7 @@ impl DecisionEngine {
             r#"  - {"action":"tool","tool":"conv_load","args":{"conversation_id":"<seed-or-8hex-id>","max_messages":200}}"#,
             r#"  - {"action":"noop"}"#,
             "Do not wrap JSON in Markdown fences. Do not include any extra keys.",
+            "When you call a tool, its result will appear in the context as a tool(...) message; use it to decide the next action.",
             "If you need a tool, choose tool action; otherwise choose speak.",
         ]
         .join("\n")
@@ -389,7 +392,10 @@ impl AgentRuntime {
                                         topic.clone(),
                                         Sender::Agent(self.cfg.id.clone()),
                                         conversation_id.clone(),
-                                        Event::Message(Message { text: "tool loop: max steps reached".to_string() }),
+                                        Event::Message(Message {
+                                            text: "工具调用回合数超限，已停止（请缩小任务或指定更明确的命令）。"
+                                                .to_string(),
+                                        }),
                                     ))?;
                                     break;
                                 }
@@ -411,38 +417,24 @@ impl AgentRuntime {
                                         steps += 1;
 
                                         if !self.cfg.tools_enabled {
-                                            self.bus.publish(self.bus.envelope_with_conversation(
-                                                topic.clone(),
-                                                Sender::Agent(self.cfg.id.clone()),
-                                                conversation_id.clone(),
-                                                Event::Message(Message { text: format!("工具已禁用，跳过调用：{tool}") }),
-                                            ))?;
-                                            break;
+                                            trace.push(ChatMessage {
+                                                role: ChatRole::Tool,
+                                                content: "ERROR: tools disabled".to_string(),
+                                                name: Some(tool.clone()),
+                                            });
+                                            continue;
                                         }
 
                                         let tool_result = self.tools.call(&tool, args).await;
-                                        let (display, trace_msg) = match tool_result {
+                                        let trace_msg = match tool_result {
                                             Ok(v) => {
                                                 let s = serde_json::to_string(&v).unwrap_or_else(|_| "\"<non-json>\"".to_string());
-                                                (
-                                                    format!("tool:{tool} -> {v}"),
-                                                    ChatMessage { role: ChatRole::Tool, content: s, name: Some(tool.clone()) },
-                                                )
+                                                ChatMessage { role: ChatRole::Tool, content: s, name: Some(tool.clone()) }
                                             }
                                             Err(e) => {
-                                                (
-                                                    format!("tool:{tool} error: {e}"),
-                                                    ChatMessage { role: ChatRole::Tool, content: format!("ERROR: {e}"), name: Some(tool.clone()) },
-                                                )
+                                                ChatMessage { role: ChatRole::Tool, content: format!("ERROR: {e}"), name: Some(tool.clone()) }
                                             }
                                         };
-
-                                        self.bus.publish(self.bus.envelope_with_conversation(
-                                            topic.clone(),
-                                            Sender::Agent(self.cfg.id.clone()),
-                                            conversation_id.clone(),
-                                            Event::Message(Message { text: display }),
-                                        ))?;
 
                                         trace.push(trace_msg);
                                         continue;
