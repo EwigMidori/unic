@@ -30,10 +30,12 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 
 - 普通输入：向当前 topic 发言（默认 `#general`）
 - 管理命令（以 `/` 开头）：
+  - `/agents`（列出当前运行中的 Agent）
   - `/dm <AgentId>`（切到与该 Agent 的私聊 topic，并让它 join）
   - `/topic <name>`
   - `/spawn <AgentId>`
   - `/kill <AgentId>`
+  - `/purge <AgentId>`（两步确认：先请求，再 `/purge <AgentId> yes` 真正删除磁盘目录）
   - `/join <AgentId> <topic>`
   - `/sleep <AgentId>`
   - `/wake <AgentId>`

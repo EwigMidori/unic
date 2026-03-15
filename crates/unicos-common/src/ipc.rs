@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
     Ping,
+    ListAgents,
     Publish {
         topic: Topic,
         text: String,
@@ -18,7 +19,7 @@ pub enum ClientRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Pong,
+    Agents { ids: Vec<crate::AgentId> },
     Error { message: String },
     Event { envelope: Envelope<Event> },
 }
-

@@ -4,6 +4,7 @@ use reedline::{
     MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText, Suggestion,
 };
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -30,6 +31,54 @@ fn parse_args() -> String {
 
 fn user_dm_id() -> &'static str {
     "sudo"
+}
+
+#[derive(Default)]
+struct CompletionState {
+    active_agents: BTreeSet<String>,
+    known_agents: BTreeSet<String>,
+    topics: BTreeSet<String>,
+}
+
+impl CompletionState {
+    fn note_topic(&mut self, topic: &Topic) {
+        self.topics.insert(topic.to_string());
+    }
+
+    fn note_agent_spawned(&mut self, id: &AgentId) {
+        self.active_agents.insert(id.to_string());
+        self.known_agents.insert(id.to_string());
+    }
+
+    fn note_agent_killed(&mut self, id: &AgentId) {
+        self.active_agents.remove(id.as_str());
+        self.known_agents.insert(id.to_string());
+    }
+
+    fn note_agent_purged(&mut self, id: &AgentId) {
+        self.active_agents.remove(id.as_str());
+        self.known_agents.remove(id.as_str());
+    }
+
+    fn agent_suggestions(&self) -> Vec<String> {
+        let mut out = self.active_agents.iter().cloned().collect::<Vec<_>>();
+        for id in &self.known_agents {
+            if !self.active_agents.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+
+    fn topic_suggestions(&self) -> Vec<String> {
+        let mut out = vec!["#general".to_string(), "#system".to_string(), "#project_x".to_string()];
+        for t in &self.topics {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
 }
 
 fn format_event(env: Envelope<Event>) -> Option<String> {
@@ -135,25 +184,27 @@ impl Highlighter for UnicosHighlighter {
 
 struct UnicosCompleter {
     commands: Vec<(&'static str, &'static str)>,
-    topics: Vec<&'static str>,
+    state: Arc<Mutex<CompletionState>>,
 }
 
-impl Default for UnicosCompleter {
-    fn default() -> Self {
+impl UnicosCompleter {
+    fn new(state: Arc<Mutex<CompletionState>>) -> Self {
         Self {
             commands: vec![
                 ("/ping", "daemon connectivity"),
+                ("/agents", "list running agents"),
                 ("/topic", "switch current topic"),
                 ("/dm", "switch to dm with agent"),
                 ("/spawn", "spawn agent"),
                 ("/kill", "kill agent"),
+                ("/purge", "delete agent on disk (needs confirm)"),
                 ("/join", "agent join topic"),
                 ("/sleep", "sleep agent"),
                 ("/wake", "wake agent"),
                 ("/quit", "exit cli"),
                 ("/exit", "exit cli"),
             ],
-            topics: vec!["#general", "#system", "#project_x"],
+            state,
         }
     }
 }
@@ -179,6 +230,25 @@ impl UnicosCompleter {
 
 impl Completer for UnicosCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('@') {
+            let (start, end, prefix) = Self::word_span(line, pos);
+            let span = Span::new(start, end);
+            let prefix = prefix.strip_prefix('@').unwrap_or(prefix);
+            let agents = self.state.lock().unwrap().agent_suggestions();
+            return agents
+                .into_iter()
+                .filter(|a| a.starts_with(prefix))
+                .map(|a| Suggestion {
+                    value: format!("@{a}"),
+                    description: Some("dm".to_string()),
+                    span,
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
+        }
+
         let (start, end, prefix) = Self::word_span(line, pos);
         let tokens = Self::tokenize(&line[..pos]);
         let span = Span::new(start, end);
@@ -204,13 +274,31 @@ impl Completer for UnicosCompleter {
 
             let cmd = tokens.first().copied().unwrap_or("");
             let arg_index = tokens.len().saturating_sub(1);
+            let completing_agent = matches!(cmd, "/kill" | "/sleep" | "/wake" | "/purge" | "/dm" | "/join") && arg_index == 1;
+            if completing_agent {
+                let agents = self.state.lock().unwrap().agent_suggestions();
+                for a in agents {
+                    if a.starts_with(prefix) || prefix.is_empty() {
+                        out.push(Suggestion {
+                            value: a,
+                            description: Some("agent".to_string()),
+                            span,
+                            append_whitespace: true,
+                            ..Suggestion::default()
+                        });
+                    }
+                }
+                return out;
+            }
+
             let completing_topic =
                 (matches!(cmd, "/topic") && arg_index == 1) || (matches!(cmd, "/join") && arg_index == 2);
             if completing_topic {
-                for t in &self.topics {
+                let topics = self.state.lock().unwrap().topic_suggestions();
+                for t in topics {
                     if t.starts_with(prefix) || prefix.is_empty() {
                         out.push(Suggestion {
-                            value: (*t).to_string(),
+                            value: t,
                             description: Some("topic".to_string()),
                             span,
                             append_whitespace: true,
@@ -254,11 +342,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let current_topic = Arc::new(Mutex::new(Topic::new("general")));
     let prompt_topic = Arc::new(Mutex::new("#general".to_string()));
+    let completion_state = Arc::new(Mutex::new(CompletionState::default()));
 
     let printer = ExternalPrinter::default();
     let printer_for_server = printer.clone();
     let printer_for_cli = printer.clone();
 
+    let completion_state_for_server = Arc::clone(&completion_state);
     tokio::spawn(async move {
         let mut lines = BufReader::new(read_half).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -271,12 +361,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             match msg {
                 ServerMessage::Event { envelope } => {
+                    {
+                        let mut st = completion_state_for_server.lock().unwrap();
+                        st.note_topic(&envelope.topic);
+                        if let Event::SystemNotification(ref n) = envelope.payload {
+                            match n {
+                                unicos_common::SystemNotification::AgentSpawned { id } => st.note_agent_spawned(id),
+                                unicos_common::SystemNotification::AgentKilled { id } => st.note_agent_killed(id),
+                                unicos_common::SystemNotification::AgentPurged { id } => st.note_agent_purged(id),
+                                _ => {}
+                            }
+                        }
+                    }
                     if let Some(s) = format_event(envelope) {
                         let _ = printer_for_server.print(s);
                     }
                 }
                 ServerMessage::Pong => {
                     let _ = printer_for_server.print("Pong".to_string());
+                }
+                ServerMessage::Agents { ids } => {
+                    let list = ids
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = printer_for_server.print(format!("agents: {list}"));
                 }
                 ServerMessage::Error { message } => {
                     let _ = printer_for_server.print(format!("[daemon error] {message}"));
@@ -290,6 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         topic: Arc::clone(&prompt_topic),
     };
 
+    let completion_state_for_editor = Arc::clone(&completion_state);
     tokio::task::spawn_blocking(move || {
         let mut keybindings = default_emacs_keybindings();
         add_completion_keybindings(&mut keybindings);
@@ -305,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut editor = Reedline::create()
             .with_external_printer(printer)
             .with_highlighter(Box::new(UnicosHighlighter::default()))
-            .with_completer(Box::new(UnicosCompleter::default()))
+            .with_completer(Box::new(UnicosCompleter::new(completion_state_for_editor)))
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(edit_mode);
 
@@ -369,6 +480,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
                 }
+                ["agents"] => {
+                    let req = ClientRequest::ListAgents;
+                    write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
+                    write_half.write_all(b"\n").await?;
+                }
                 ["spawn", id] => {
                     let req = ClientRequest::Command {
                         cmd: Command::Spawn {
@@ -388,6 +504,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
                     let _ = printer_for_cli.print(format!("kill requested: {id}"));
+                }
+                ["purge", id] => {
+                    let req = ClientRequest::Command {
+                        cmd: Command::Purge {
+                            id: AgentId::new(*id),
+                            confirm: false,
+                        },
+                    };
+                    write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
+                    write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!(
+                        "purge requested: {id}. confirm with: /purge {id} yes (within 30s)"
+                    ));
+                }
+                ["purge", id, "yes"] => {
+                    let req = ClientRequest::Command {
+                        cmd: Command::Purge {
+                            id: AgentId::new(*id),
+                            confirm: true,
+                        },
+                    };
+                    write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
+                    write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("purge confirm sent: {id}"));
                 }
                 ["join", id, topic] => {
                     let req = ClientRequest::Command {
@@ -460,6 +600,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ["kill"] => {
                     let _ = printer_for_cli.print("usage: /kill <AgentId>".to_string());
+                }
+                ["purge"] => {
+                    let _ = printer_for_cli
+                        .print("usage: /purge <AgentId>  (then: /purge <AgentId> yes)".to_string());
                 }
                 ["join"] => {
                     let _ = printer_for_cli.print("usage: /join <AgentId> <topic>".to_string());

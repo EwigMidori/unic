@@ -4,6 +4,7 @@ use std::env;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -271,6 +272,7 @@ pub struct Orchestrator {
     cancel: CancellationToken,
     agent_exit_tx: mpsc::Sender<AgentExit>,
     agent_exit_rx: Option<mpsc::Receiver<AgentExit>>,
+    pending_purge: HashMap<AgentId, Instant>,
 }
 
 impl Orchestrator {
@@ -309,6 +311,7 @@ impl Orchestrator {
             cancel: CancellationToken::new(),
             agent_exit_tx,
             agent_exit_rx: Some(agent_exit_rx),
+            pending_purge: HashMap::new(),
         }
     }
 
@@ -420,6 +423,37 @@ impl Orchestrator {
         Ok(())
     }
 
+    async fn purge_agent(&mut self, id: AgentId, confirm: bool) -> Result<(), UnicError> {
+        const TTL: Duration = Duration::from_secs(30);
+
+        if !confirm {
+            self.pending_purge.insert(id, Instant::now());
+            return Ok(());
+        }
+
+        let Some(t0) = self.pending_purge.remove(&id) else {
+            return Ok(());
+        };
+        if t0.elapsed() > TTL {
+            return Ok(());
+        }
+
+        self.kill_agent(id.clone()).await?;
+        let soul_dir = self.cfg.paths.unics_dir.join(id.as_str());
+        match tokio::fs::remove_dir_all(&soul_dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        self.bus.publish(self.bus.envelope(
+            Topic::new("system"),
+            Sender::System,
+            Event::SystemNotification(unicos_common::SystemNotification::AgentPurged { id }),
+        ))?;
+        Ok(())
+    }
+
     async fn ensure_default_agent_files(&self, id: &AgentId, soul_dir: &Path) -> Result<(), UnicError> {
         let soul_md = soul_dir.join("soul.md");
         match tokio::fs::metadata(&soul_md).await {
@@ -471,6 +505,7 @@ Rules:
         match cmd {
             Command::Spawn { id } => self.spawn_agent(id).await?,
             Command::Kill { id } => self.kill_agent(id).await?,
+            Command::Purge { id, confirm } => self.purge_agent(id, confirm).await?,
             Command::JoinTopic { ref id, ref topic } => {
                 if topic.is_dm() {
                     let Some((a, b)) = topic.dm_participants() else {
@@ -693,6 +728,47 @@ tools_enabled = false
             .unwrap());
 
         orch.kill_agent(AgentId::new("Alice")).await.unwrap();
+        orch.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn purge_requires_two_step_confirm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unics_dir = tmp.path().join("unics");
+        tokio::fs::create_dir_all(&unics_dir).await.unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths.unics_dir = unics_dir.clone();
+        cfg.paths.god_log = tmp.path().join("god.log");
+        cfg.llm = None;
+
+        let mut orch = Orchestrator::new(cfg);
+        orch.spawn_agent(AgentId::new("Bob")).await.unwrap();
+        let soul_dir = unics_dir.join("Bob");
+        assert!(tokio::fs::try_exists(&soul_dir).await.unwrap());
+
+        orch.handle_command(Command::Purge {
+            id: AgentId::new("Bob"),
+            confirm: true,
+        })
+        .await
+        .unwrap();
+        assert!(tokio::fs::try_exists(&soul_dir).await.unwrap());
+
+        orch.handle_command(Command::Purge {
+            id: AgentId::new("Bob"),
+            confirm: false,
+        })
+        .await
+        .unwrap();
+        orch.handle_command(Command::Purge {
+            id: AgentId::new("Bob"),
+            confirm: true,
+        })
+        .await
+        .unwrap();
+        assert!(!tokio::fs::try_exists(&soul_dir).await.unwrap());
+
         orch.cancel.cancel();
     }
 }

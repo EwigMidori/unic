@@ -5,6 +5,8 @@ use tracing::{info, warn};
 use unicos_common::ipc::{ClientRequest, ServerMessage};
 use unicos_common::{Event, Message, Sender, Topic, UnicError};
 use unicos_core::Config;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn parse_args() -> (std::path::PathBuf, Option<std::path::PathBuf>, bool) {
     let mut config = std::path::PathBuf::from("/etc/unicos/config.toml");
@@ -30,7 +32,11 @@ fn parse_args() -> (std::path::PathBuf, Option<std::path::PathBuf>, bool) {
     (config, socket, no_fs_watch)
 }
 
-async fn handle_client(stream: UnixStream, bus: unicos_bus::Bus) -> Result<(), UnicError> {
+async fn handle_client(
+    stream: UnixStream,
+    bus: unicos_bus::Bus,
+    agent_index: Arc<Mutex<BTreeSet<String>>>,
+) -> Result<(), UnicError> {
     let (read_half, write_half) = stream.into_split();
     let write_half = std::sync::Arc::new(Mutex::new(write_half));
 
@@ -76,6 +82,17 @@ async fn handle_client(stream: UnixStream, bus: unicos_bus::Bus) -> Result<(), U
         match req {
             ClientRequest::Ping => {
                 let msg = ServerMessage::Pong;
+                let mut w = write_half.lock().await;
+                w.write_all(serde_json::to_string(&msg).unwrap().as_bytes())
+                    .await?;
+                w.write_all(b"\n").await?;
+            }
+            ClientRequest::ListAgents => {
+                let ids = {
+                    let idx = agent_index.lock().await;
+                    idx.iter().cloned().map(unicos_common::AgentId::new).collect::<Vec<_>>()
+                };
+                let msg = ServerMessage::Agents { ids };
                 let mut w = write_half.lock().await;
                 w.write_all(serde_json::to_string(&msg).unwrap().as_bytes())
                     .await?;
@@ -137,6 +154,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("unicosd listening on {}", socket_path.display());
 
     let server_bus = bus.clone();
+    let agent_index: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+
+    // Maintain an index of running agents for list/completion.
+    {
+        let agent_index = Arc::clone(&agent_index);
+        let mut rx = bus.subscribe();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    recv = rx.recv() => {
+                        let Ok(env) = recv else { continue };
+                        if let Event::SystemNotification(n) = env.payload {
+                            match n {
+                                unicos_common::SystemNotification::AgentSpawned { id } => {
+                                    agent_index.lock().await.insert(id.to_string());
+                                }
+                                unicos_common::SystemNotification::AgentKilled { id } => {
+                                    agent_index.lock().await.remove(id.as_str());
+                                }
+                                unicos_common::SystemNotification::AgentPurged { id } => {
+                                    agent_index.lock().await.remove(id.as_str());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let mut server_task = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -144,8 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(_) => return,
             };
             let bus = server_bus.clone();
+            let agent_index = Arc::clone(&agent_index);
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, bus).await {
+                if let Err(e) = handle_client(stream, bus, agent_index).await {
                     warn!("client handler error: {e}");
                 }
             });

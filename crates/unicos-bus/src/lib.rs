@@ -19,7 +19,10 @@ impl Bus {
     }
 
     pub fn publish(&self, envelope: Envelope<Event>) -> Result<(), UnicError> {
-        self.tx.send(envelope).map(|_| ()).map_err(|_| UnicError::BusSend)
+        // `tokio::sync::broadcast` returns `SendError` when there are no active receivers.
+        // For UnicOS, publishing should be best-effort: lack of subscribers is not an error.
+        let _ = self.tx.send(envelope);
+        Ok(())
     }
 
     pub fn envelope(&self, topic: Topic, sender: Sender, payload: Event) -> Envelope<Event> {

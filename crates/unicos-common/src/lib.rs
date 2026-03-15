@@ -105,6 +105,7 @@ pub struct Message {
 pub enum Command {
     Spawn { id: AgentId },
     Kill { id: AgentId },
+    Purge { id: AgentId, confirm: bool },
     JoinTopic { id: AgentId, topic: Topic },
     Sleep { id: AgentId },
     Wake { id: AgentId },
@@ -115,6 +116,7 @@ pub enum Command {
 pub enum SystemNotification {
     AgentSpawned { id: AgentId },
     AgentKilled { id: AgentId },
+    AgentPurged { id: AgentId },
     AgentPanicked { id: AgentId, message: String },
     AgentJoinedTopic { id: AgentId, topic: Topic },
     AgentSlept { id: AgentId },
