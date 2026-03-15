@@ -488,8 +488,6 @@ impl AgentRuntime {
                             let mut trace: Vec<ChatMessage> = Vec::new();
                             let mut steps = 0usize;
                             let max_steps = 6usize;
-                            let mut last_say_args_json: Option<String> = None;
-                            let mut repeated_say_calls = 0usize;
                             loop {
                                 if steps >= max_steps {
                                     let _ = self.publish_say(
@@ -527,12 +525,6 @@ impl AgentRuntime {
                                         steps += 1;
 
                                         if tool == "say" {
-                                            let args_json = serde_json::to_string(&args).unwrap_or_default();
-                                            if last_say_args_json.as_deref() == Some(&args_json) {
-                                                repeated_say_calls += 1;
-                                            }
-                                            last_say_args_json = Some(args_json);
-
                                             let published = self.publish_say(&topic, &conversation_id, args)?;
                                             trace.push(ChatMessage {
                                                 role: ChatRole::Tool,
@@ -542,10 +534,6 @@ impl AgentRuntime {
                                                 .to_string(),
                                                 name: Some("say".to_string()),
                                             });
-                                            // Allow multiple say calls, but avoid infinite loops that keep issuing the exact same call.
-                                            if repeated_say_calls >= 1 {
-                                                break;
-                                            }
                                             continue;
                                         }
 
