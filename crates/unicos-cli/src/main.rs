@@ -257,6 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let printer = ExternalPrinter::default();
     let printer_for_server = printer.clone();
+    let printer_for_cli = printer.clone();
 
     tokio::spawn(async move {
         let mut lines = BufReader::new(read_half).lines();
@@ -356,6 +357,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 write_half.write_all(b"\n").await?;
                 continue;
             }
+            let _ = printer_for_cli.print("usage: @<AgentId> <text>".to_string());
+            continue;
         }
 
         if let Some(rest) = line.strip_prefix('/') {
@@ -374,6 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("spawn requested: {id}"));
                 }
                 ["kill", id] => {
                     let req = ClientRequest::Command {
@@ -383,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("kill requested: {id}"));
                 }
                 ["join", id, topic] => {
                     let req = ClientRequest::Command {
@@ -393,6 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("join requested: {id} -> {topic}"));
                 }
                 ["sleep", id] => {
                     let req = ClientRequest::Command {
@@ -402,6 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("sleep requested: {id}"));
                 }
                 ["wake", id] => {
                     let req = ClientRequest::Command {
@@ -411,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write_half.write_all(serde_json::to_string(&req)?.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("wake requested: {id}"));
                 }
                 ["topic", topic] => {
                     let t = Topic::new(*topic);
@@ -422,6 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pt = prompt_topic.lock().unwrap();
                         *pt = t.to_string();
                     }
+                    let _ = printer_for_cli.print(format!("switched topic: {t}"));
                 }
                 ["dm", peer] => {
                     let dm_topic = Topic::dm(user_dm_id(), *peer);
@@ -444,8 +453,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .write_all(serde_json::to_string(&join)?.as_bytes())
                         .await?;
                     write_half.write_all(b"\n").await?;
+                    let _ = printer_for_cli.print(format!("switched to dm with {peer}"));
                 }
-                _ => {}
+                ["spawn"] => {
+                    let _ = printer_for_cli.print("usage: /spawn <AgentId>".to_string());
+                }
+                ["kill"] => {
+                    let _ = printer_for_cli.print("usage: /kill <AgentId>".to_string());
+                }
+                ["join"] => {
+                    let _ = printer_for_cli.print("usage: /join <AgentId> <topic>".to_string());
+                }
+                ["sleep"] => {
+                    let _ = printer_for_cli.print("usage: /sleep <AgentId>".to_string());
+                }
+                ["wake"] => {
+                    let _ = printer_for_cli.print("usage: /wake <AgentId>".to_string());
+                }
+                ["topic"] => {
+                    let _ = printer_for_cli.print("usage: /topic <topic>".to_string());
+                }
+                ["dm"] => {
+                    let _ = printer_for_cli.print("usage: /dm <AgentId>".to_string());
+                }
+                _ => {
+                    let _ = printer_for_cli.print(format!("unknown command: /{rest}"));
+                }
             }
             continue;
         }
