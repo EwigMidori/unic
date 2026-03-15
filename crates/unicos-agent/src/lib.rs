@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use unicos_bus::Bus;
 use unicos_common::{
-    AgentId, ChatMessage, ChatRole, Command, ConversationId, Envelope, Event, Message, Perception,
+    AgentId, ChatMessage, ChatRole, Command, Envelope, Event, Message, Perception,
     Sender, Topic, UnicError,
 };
 use unicos_llm::LlmProvider;
@@ -27,6 +28,18 @@ pub struct AgentConfig {
 pub enum AgentAction {
     Speak(String),
     ToolCall { tool: String, args: Value },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum NextAction {
+    Speak { text: String },
+    Tool {
+        tool: String,
+        #[serde(default)]
+        args: Value,
+    },
+    Noop,
 }
 
 #[derive(Debug)]
@@ -95,7 +108,45 @@ impl DecisionEngine {
         Self { provider }
     }
 
-    pub async fn decide(&self, perception: &Perception) -> Result<Option<AgentAction>, UnicError> {
+    fn tool_protocol_system_prompt() -> String {
+        [
+            "You are an autonomous agent running inside UnicOS.",
+            "You can think silently, but you MUST output ONLY a single JSON object as your final output.",
+            "Valid actions:",
+            r#"  - {"action":"speak","text":"..."}"#,
+            r#"  - {"action":"tool","tool":"bash","args":{"cmd":"...","timeout_ms":30000}}"#,
+            r#"  - {"action":"tool","tool":"fs","args":{"op":"read","path":"/path","max_bytes":65536}}"#,
+            r#"  - {"action":"tool","tool":"fs","args":{"op":"write","path":"/path","data":"...","append":true}}"#,
+            r#"  - {"action":"tool","tool":"net","args":{"method":"GET","url":"https://...","headers":{},"body":null}}"#,
+            r#"  - {"action":"tool","tool":"conv_load","args":{"conversation_id":"<seed-or-8hex-id>","max_messages":200}}"#,
+            r#"  - {"action":"noop"}"#,
+            "Do not wrap JSON in Markdown fences. Do not include any extra keys.",
+            "If you need a tool, choose tool action; otherwise choose speak.",
+        ]
+        .join("\n")
+    }
+
+    fn strip_json_fence(s: &str) -> &str {
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("```json") {
+            return rest.trim().trim_end_matches("```").trim();
+        }
+        if let Some(rest) = s.strip_prefix("```") {
+            return rest.trim().trim_end_matches("```").trim();
+        }
+        s
+    }
+
+    fn parse_next_action(raw: &str) -> Option<NextAction> {
+        let raw = Self::strip_json_fence(raw);
+        serde_json::from_str::<NextAction>(raw).ok()
+    }
+
+    pub async fn decide_with_trace(
+        &self,
+        perception: &Perception,
+        trace: &[ChatMessage],
+    ) -> Result<Option<AgentAction>, UnicError> {
         let last = perception.recent.last().map(|m| m.payload.text.clone()).unwrap_or_default();
         if let Some(cmd) = last.strip_prefix("!bash ") {
             return Ok(Some(AgentAction::ToolCall {
@@ -122,11 +173,16 @@ impl DecisionEngine {
             }));
         }
 
-        if !self.provider.should_respond(perception).await? {
+        if trace.is_empty() && !self.provider.should_respond(perception).await? {
             return Ok(None);
         }
 
         let mut prompt = Vec::new();
+        prompt.push(ChatMessage {
+            role: ChatRole::System,
+            content: Self::tool_protocol_system_prompt(),
+            name: None,
+        });
         if !perception.soul.trim().is_empty() {
             prompt.push(ChatMessage {
                 role: ChatRole::System,
@@ -145,9 +201,29 @@ impl DecisionEngine {
                 name: None,
             });
         }
+        prompt.extend_from_slice(trace);
+        prompt.push(ChatMessage {
+            role: ChatRole::User,
+            content: "Return the next action JSON now.".to_string(),
+            name: None,
+        });
 
         let text = self.provider.generate(prompt).await?;
+        if let Some(action) = Self::parse_next_action(&text) {
+            return Ok(match action {
+                NextAction::Speak { text } => Some(AgentAction::Speak(text)),
+                NextAction::Tool { tool, args } => {
+                    let args = if args.is_null() { serde_json::json!({}) } else { args };
+                    Some(AgentAction::ToolCall { tool, args })
+                }
+                NextAction::Noop => None,
+            });
+        }
         Ok(Some(AgentAction::Speak(text)))
+    }
+
+    pub async fn decide(&self, perception: &Perception) -> Result<Option<AgentAction>, UnicError> {
+        self.decide_with_trace(perception, &[]).await
     }
 }
 
@@ -241,47 +317,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn act(
-        &self,
-        topic: Topic,
-        conversation_id: ConversationId,
-        action: AgentAction,
-    ) -> Result<(), UnicError> {
-        match action {
-            AgentAction::Speak(text) => {
-                self.bus.publish(self.bus.envelope_with_conversation(
-                    topic,
-                    Sender::Agent(self.cfg.id.clone()),
-                    conversation_id,
-                    Event::Message(Message { text }),
-                ))?;
-            }
-            AgentAction::ToolCall { tool, args } => {
-                if !self.cfg.tools_enabled {
-                    self.bus.publish(self.bus.envelope_with_conversation(
-                        topic,
-                        Sender::Agent(self.cfg.id.clone()),
-                        conversation_id.clone(),
-                        Event::Message(Message {
-                            text: format!("工具已禁用，跳过调用：{tool}"),
-                        }),
-                    ))?;
-                    return Ok(());
-                }
-                let result = self.tools.call(&tool, args).await?;
-                self.bus.publish(self.bus.envelope_with_conversation(
-                    topic,
-                    Sender::Agent(self.cfg.id.clone()),
-                    conversation_id,
-                    Event::Message(Message {
-                        text: format!("tool:{tool} -> {}", result),
-                    }),
-                ))?;
-            }
-        }
-        Ok(())
-    }
-
     pub async fn run(mut self) -> Result<(), UnicError> {
         info!("agent {} started", self.cfg.id);
         loop {
@@ -345,8 +380,74 @@ impl AgentRuntime {
                                 recent: self.ctx.snapshot(),
                             };
 
-                            if let Some(action) = self.decision.decide(&perception).await? {
-                                self.act(topic.clone(), conversation_id.clone(), action).await?;
+                            let mut trace: Vec<ChatMessage> = Vec::new();
+                            let mut steps = 0usize;
+                            let max_steps = 6usize;
+                            loop {
+                                if steps >= max_steps {
+                                    self.bus.publish(self.bus.envelope_with_conversation(
+                                        topic.clone(),
+                                        Sender::Agent(self.cfg.id.clone()),
+                                        conversation_id.clone(),
+                                        Event::Message(Message { text: "tool loop: max steps reached".to_string() }),
+                                    ))?;
+                                    break;
+                                }
+
+                                let Some(action) = self.decision.decide_with_trace(&perception, &trace).await? else {
+                                    break;
+                                };
+                                match action {
+                                    AgentAction::Speak(text) => {
+                                        self.bus.publish(self.bus.envelope_with_conversation(
+                                            topic.clone(),
+                                            Sender::Agent(self.cfg.id.clone()),
+                                            conversation_id.clone(),
+                                            Event::Message(Message { text }),
+                                        ))?;
+                                        break;
+                                    }
+                                    AgentAction::ToolCall { tool, args } => {
+                                        steps += 1;
+
+                                        if !self.cfg.tools_enabled {
+                                            self.bus.publish(self.bus.envelope_with_conversation(
+                                                topic.clone(),
+                                                Sender::Agent(self.cfg.id.clone()),
+                                                conversation_id.clone(),
+                                                Event::Message(Message { text: format!("工具已禁用，跳过调用：{tool}") }),
+                                            ))?;
+                                            break;
+                                        }
+
+                                        let tool_result = self.tools.call(&tool, args).await;
+                                        let (display, trace_msg) = match tool_result {
+                                            Ok(v) => {
+                                                let s = serde_json::to_string(&v).unwrap_or_else(|_| "\"<non-json>\"".to_string());
+                                                (
+                                                    format!("tool:{tool} -> {v}"),
+                                                    ChatMessage { role: ChatRole::Tool, content: s, name: Some(tool.clone()) },
+                                                )
+                                            }
+                                            Err(e) => {
+                                                (
+                                                    format!("tool:{tool} error: {e}"),
+                                                    ChatMessage { role: ChatRole::Tool, content: format!("ERROR: {e}"), name: Some(tool.clone()) },
+                                                )
+                                            }
+                                        };
+
+                                        self.bus.publish(self.bus.envelope_with_conversation(
+                                            topic.clone(),
+                                            Sender::Agent(self.cfg.id.clone()),
+                                            conversation_id.clone(),
+                                            Event::Message(Message { text: display }),
+                                        ))?;
+
+                                        trace.push(trace_msg);
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     }
@@ -359,6 +460,7 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicos_common::ConversationId;
     use unicos_llm::RuleBasedProvider;
 
     #[tokio::test]

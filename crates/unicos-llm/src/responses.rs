@@ -63,10 +63,14 @@ impl ResponsesProvider {
                 ChatRole::Assistant => "assistant",
                 ChatRole::Tool => "tool",
             };
+            let label = match msg.name.as_deref() {
+                Some(name) if !name.trim().is_empty() => format!("{role}({name})"),
+                _ => role.to_string(),
+            };
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(role);
+            out.push_str(&label);
             out.push_str(": ");
             out.push_str(msg.content.trim());
         }
@@ -215,6 +219,9 @@ impl LlmProvider for ResponsesProvider {
     }
 
     async fn should_respond(&self, context: &Perception) -> Result<bool, UnicError> {
+        if context.topic.is_dm() {
+            return Ok(true);
+        }
         if context
             .recent
             .iter()
@@ -223,6 +230,24 @@ impl LlmProvider for ResponsesProvider {
             .is_none()
         {
             return Ok(false);
+        }
+
+        if let Some(last) = context
+            .recent
+            .iter()
+            .rev()
+            .find(|m| matches!(m.sender, Sender::UserSudo))
+            .map(|m| m.payload.text.trim().to_string())
+        {
+            if last.starts_with('!') || last.starts_with('/') {
+                return Ok(true);
+            }
+            if last.contains('?') || last.contains('？') {
+                return Ok(true);
+            }
+            if last.contains(&format!("@{}", context.agent_id.as_str())) {
+                return Ok(true);
+            }
         }
 
         let input = Self::perception_to_gate_input(context);

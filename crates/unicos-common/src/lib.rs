@@ -82,12 +82,14 @@ impl ConversationId {
         let seed = if seed.is_empty() { "default" } else { seed };
         let input = format!("unicos:conversation:{seed}");
         let hash = blake3::hash(input.as_bytes());
-        Self(hash.to_hex().to_string())
+        let full = hash.to_hex().to_string();
+        let short = full.get(0..8).unwrap_or(&full).to_string();
+        Self(short)
     }
 
     pub fn parse_hex(raw: impl AsRef<str>) -> Option<Self> {
         let raw = raw.as_ref().trim();
-        if raw.len() != 64 {
+        if raw.len() != 8 {
             return None;
         }
         if !raw.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -274,7 +276,7 @@ mod tests {
         let a = ConversationId::from_seed("task-1");
         let b = ConversationId::from_seed("task-1");
         assert_eq!(a, b);
-        assert_eq!(a.as_str().len(), 64);
+        assert_eq!(a.as_str().len(), 8);
         assert!(ConversationId::parse_hex(a.as_str()).is_some());
     }
 }

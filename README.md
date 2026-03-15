@@ -34,7 +34,7 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
   - `/agents`（列出当前运行中的 Agent）
   - `/dm <AgentId>`（切到与该 Agent 的私聊 topic，并让它 join）
   - `/topic <name>`
-  - `/conv <seed-or-64hex-id>`（切换当前 conversation_id；会在后台聚合成 `{conv_id}.json`）
+  - `/conv <seed-or-8hex-id>`（切换当前 conversation_id；会在后台聚合成 `{conv_id}.json`）
   - `/spawn <AgentId>`
   - `/kill <AgentId>`
   - `/purge <AgentId>`（两步确认：先请求，再 `/purge <AgentId> yes` 真正删除磁盘目录）
@@ -123,6 +123,6 @@ EOF
 - `!bash <cmd>`
 - `!fs_read <path>`
 - `!net_get <url>`
-- `!conv_load <seed-or-64hex-id>`
+- `!conv_load <seed-or-8hex-id>`
 
 工具返回会以普通消息形式回流到总线。
