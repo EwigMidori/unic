@@ -61,6 +61,7 @@ pub struct BashExecutor;
 struct BashArgs {
     cmd: String,
     timeout_ms: Option<u64>,
+    cwd: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -74,7 +75,12 @@ impl SystemTool for BashExecutor {
         let timeout_ms = args.timeout_ms.unwrap_or(30_000);
 
         let fut = async move {
-            let output = Command::new("bash").arg("-lc").arg(args.cmd).output().await?;
+            let mut cmd = Command::new("bash");
+            cmd.arg("-lc").arg(args.cmd);
+            if let Some(cwd) = args.cwd {
+                cmd.current_dir(cwd);
+            }
+            let output = cmd.output().await?;
             Ok::<_, std::io::Error>(output)
         };
 

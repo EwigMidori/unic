@@ -31,6 +31,14 @@ pub enum AgentAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct SayArgs {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    messages: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum NextAction {
     Speak { text: String },
@@ -112,19 +120,22 @@ impl DecisionEngine {
         [
             "You are an autonomous agent running inside UnicOS.",
             "IMPORTANT: Tool calls and tool outputs are PRIVATE to you. Other participants will NOT see them.",
-            "After using any tool, you MUST send a normal speak message that includes the relevant results (a short, user-facing summary and key output lines).",
+            "You MUST NOT speak directly. To send messages to the chat, you MUST use the `say` tool.",
+            "After using any tool, you MUST use `say` to communicate the relevant results (a short summary and key lines).",
+            "Do not dump raw stdout/json; summarize and include only the most relevant lines unless the user asked for full output.",
             "You can think silently, but you MUST output ONLY a single JSON object as your final output.",
-            "Valid actions:",
-            r#"  - {"action":"speak","text":"..."}"#,
+            "Valid actions (respond with exactly one):",
             r#"  - {"action":"tool","tool":"bash","args":{"cmd":"...","timeout_ms":30000}}"#,
             r#"  - {"action":"tool","tool":"fs","args":{"op":"read","path":"/path","max_bytes":65536}}"#,
             r#"  - {"action":"tool","tool":"fs","args":{"op":"write","path":"/path","data":"...","append":true}}"#,
             r#"  - {"action":"tool","tool":"net","args":{"method":"GET","url":"https://...","headers":{},"body":null}}"#,
             r#"  - {"action":"tool","tool":"conv_load","args":{"conversation_id":"<seed-or-8hex-id>","max_messages":200}}"#,
+            r#"  - {"action":"tool","tool":"say","args":{"text":"..."} }"#,
+            r#"  - {"action":"tool","tool":"say","args":{"messages":["...","..."]} }"#,
             r#"  - {"action":"noop"}"#,
             "Do not wrap JSON in Markdown fences. Do not include any extra keys.",
             "When you call a tool, its result will appear in the context as a tool(...) message; use it to decide the next action.",
-            "If you need a tool, choose tool action; otherwise choose speak.",
+            "Be natural, friendly, and concise. Avoid robotic phrasing.",
         ]
         .join("\n")
     }
@@ -143,6 +154,13 @@ impl DecisionEngine {
     fn parse_next_action(raw: &str) -> Option<NextAction> {
         let raw = Self::strip_json_fence(raw);
         serde_json::from_str::<NextAction>(raw).ok()
+    }
+
+    fn speak_to_say(text: String) -> AgentAction {
+        AgentAction::ToolCall {
+            tool: "say".to_string(),
+            args: serde_json::json!({ "text": text }),
+        }
     }
 
     pub async fn decide_with_trace(
@@ -214,7 +232,7 @@ impl DecisionEngine {
         let text = self.provider.generate(prompt).await?;
         if let Some(action) = Self::parse_next_action(&text) {
             return Ok(match action {
-                NextAction::Speak { text } => Some(AgentAction::Speak(text)),
+                NextAction::Speak { text } => Some(Self::speak_to_say(text)),
                 NextAction::Tool { tool, args } => {
                     let args = if args.is_null() { serde_json::json!({}) } else { args };
                     Some(AgentAction::ToolCall { tool, args })
@@ -222,7 +240,7 @@ impl DecisionEngine {
                 NextAction::Noop => None,
             });
         }
-        Ok(Some(AgentAction::Speak(text)))
+        Ok(Some(Self::speak_to_say(text)))
     }
 
     pub async fn decide(&self, perception: &Perception) -> Result<Option<AgentAction>, UnicError> {
@@ -280,6 +298,78 @@ impl AgentRuntime {
 
     fn should_accept(&self, topic: &Topic) -> bool {
         self.subscribed.contains(topic)
+    }
+
+    fn rewrite_tool_args_for_home(&self, tool: &str, args: Value) -> Value {
+        let home = &self.cfg.soul_dir;
+        let mut args = match args {
+            Value::Object(map) => Value::Object(map),
+            other => other,
+        };
+
+        if tool == "bash" {
+            if let Value::Object(ref mut map) = args {
+                map.entry("cwd".to_string())
+                    .or_insert_with(|| Value::String(home.to_string_lossy().to_string()));
+            }
+        }
+
+        if tool == "fs" {
+            if let Ok(mut v) = serde_json::from_value::<serde_json::Value>(args.clone()) {
+                // Normalize relative paths to agent home for fs read/write.
+                if let Some(op) = v.get("op").and_then(|x| x.as_str()) {
+                    if matches!(op, "read" | "write") {
+                        if let Some(path) = v.get("path").and_then(|x| x.as_str()) {
+                            let p = std::path::PathBuf::from(path);
+                            if p.is_relative() {
+                                let abs = home.join(p);
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert(
+                                        "path".to_string(),
+                                        Value::String(abs.to_string_lossy().to_string()),
+                                    );
+                                }
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        args
+    }
+
+    fn publish_say(&self, topic: &Topic, conversation_id: &unicos_common::ConversationId, args: Value) -> Result<(), UnicError> {
+        let parsed: SayArgs = serde_json::from_value(args).unwrap_or(SayArgs {
+            text: None,
+            messages: None,
+        });
+        let mut msgs = Vec::new();
+        if let Some(text) = parsed.text {
+            if !text.trim().is_empty() {
+                msgs.push(text);
+            }
+        }
+        if let Some(list) = parsed.messages {
+            for m in list {
+                if !m.trim().is_empty() {
+                    msgs.push(m);
+                }
+            }
+        }
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        for text in msgs {
+            self.bus.publish(self.bus.envelope_with_conversation(
+                topic.clone(),
+                Sender::Agent(self.cfg.id.clone()),
+                conversation_id.clone(),
+                Event::Message(Message { text }),
+            ))?;
+        }
+        Ok(())
     }
 
     async fn handle_command(&mut self, cmd: Command) -> Result<(), UnicError> {
@@ -388,15 +478,13 @@ impl AgentRuntime {
                             let max_steps = 6usize;
                             loop {
                                 if steps >= max_steps {
-                                    self.bus.publish(self.bus.envelope_with_conversation(
-                                        topic.clone(),
-                                        Sender::Agent(self.cfg.id.clone()),
-                                        conversation_id.clone(),
-                                        Event::Message(Message {
-                                            text: "工具调用回合数超限，已停止（请缩小任务或指定更明确的命令）。"
-                                                .to_string(),
+                                    self.publish_say(
+                                        &topic,
+                                        &conversation_id,
+                                        serde_json::json!({
+                                            "text": "工具调用回合数超限，已停止（请缩小任务或指定更明确的命令）。",
                                         }),
-                                    ))?;
+                                    )?;
                                     break;
                                 }
 
@@ -405,16 +493,23 @@ impl AgentRuntime {
                                 };
                                 match action {
                                     AgentAction::Speak(text) => {
-                                        self.bus.publish(self.bus.envelope_with_conversation(
-                                            topic.clone(),
-                                            Sender::Agent(self.cfg.id.clone()),
-                                            conversation_id.clone(),
-                                            Event::Message(Message { text }),
-                                        ))?;
-                                        break;
+                                        // Back-compat: treat direct speak as say.
+                                        self.publish_say(&topic, &conversation_id, serde_json::json!({ "text": text }))?;
+                                        trace.push(ChatMessage { role: ChatRole::Tool, content: "{\"sent\":true}".to_string(), name: Some("say".to_string()) });
+                                        continue;
                                     }
                                     AgentAction::ToolCall { tool, args } => {
                                         steps += 1;
+
+                                        if tool == "say" {
+                                            self.publish_say(&topic, &conversation_id, args)?;
+                                            trace.push(ChatMessage {
+                                                role: ChatRole::Tool,
+                                                content: "{\"sent\":true}".to_string(),
+                                                name: Some("say".to_string()),
+                                            });
+                                            continue;
+                                        }
 
                                         if !self.cfg.tools_enabled {
                                             trace.push(ChatMessage {
@@ -425,6 +520,7 @@ impl AgentRuntime {
                                             continue;
                                         }
 
+                                        let args = self.rewrite_tool_args_for_home(&tool, args);
                                         let tool_result = self.tools.call(&tool, args).await;
                                         let trace_msg = match tool_result {
                                             Ok(v) => {
@@ -475,7 +571,7 @@ mod tests {
             }],
         };
         let action = engine.decide(&perception).await.unwrap();
-        assert!(matches!(action, Some(AgentAction::Speak(_))));
+        assert!(matches!(action, Some(AgentAction::ToolCall { tool, .. }) if tool == "say"));
     }
 
     #[tokio::test]
