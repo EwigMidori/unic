@@ -135,7 +135,7 @@ impl DecisionEngine {
             r#"  - {"action":"noop"}"#,
             "Do not wrap JSON in Markdown fences. Do not include any extra keys.",
             "When you call a tool, its result will appear in the context as a tool(...) message; use it to decide the next action.",
-            "You may call `say` multiple times, but NEVER repeat the same message. Prefer a single `say` call with `messages` when you need to send multiple lines.",
+            "You may call `say` multiple times. Prefer a single `say` call with `messages` when you need to send multiple lines.",
             "After you have communicated the answer with `say`, output {\"action\":\"noop\"} unless the user explicitly asked for more steps.",
             "Be natural, friendly, and concise. Avoid robotic phrasing.",
         ]
@@ -342,17 +342,12 @@ impl AgentRuntime {
         args
     }
 
-    fn normalize_public_message(text: &str) -> String {
-        text.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
-    }
-
     fn publish_say(
         &self,
         topic: &Topic,
         conversation_id: &unicos_common::ConversationId,
         args: Value,
-        sent: &mut HashSet<String>,
-    ) -> Result<(Vec<String>, Vec<String>), UnicError> {
+    ) -> Result<Vec<String>, UnicError> {
         let parsed: SayArgs = serde_json::from_value(args).unwrap_or(SayArgs {
             text: None,
             messages: None,
@@ -371,20 +366,14 @@ impl AgentRuntime {
             }
         }
         if msgs.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
-        let mut sent_now = Vec::new();
-        let mut suppressed = Vec::new();
+        let mut published = Vec::new();
         for text in msgs {
-            let norm = Self::normalize_public_message(&text);
-            if norm.is_empty() {
+            if text.trim().is_empty() {
                 continue;
             }
-            if !sent.insert(norm.clone()) {
-                suppressed.push(text);
-                continue;
-            }
-            sent_now.push(text.clone());
+            published.push(text.clone());
             self.bus.publish(self.bus.envelope_with_conversation(
                 topic.clone(),
                 Sender::Agent(self.cfg.id.clone()),
@@ -392,7 +381,7 @@ impl AgentRuntime {
                 Event::Message(Message { text }),
             ))?;
         }
-        Ok((sent_now, suppressed))
+        Ok(published)
     }
 
     async fn handle_command(&mut self, cmd: Command) -> Result<(), UnicError> {
@@ -499,8 +488,8 @@ impl AgentRuntime {
                             let mut trace: Vec<ChatMessage> = Vec::new();
                             let mut steps = 0usize;
                             let max_steps = 6usize;
-                            let mut sent_public: HashSet<String> = HashSet::new();
-                            let mut dup_suppressed = 0usize;
+                            let mut last_say_args_json: Option<String> = None;
+                            let mut repeated_say_calls = 0usize;
                             loop {
                                 if steps >= max_steps {
                                     let _ = self.publish_say(
@@ -509,7 +498,6 @@ impl AgentRuntime {
                                         serde_json::json!({
                                             "text": "工具调用回合数超限，已停止（请缩小任务或指定更明确的命令）。",
                                         }),
-                                        &mut sent_public,
                                     )?;
                                     break;
                                 }
@@ -520,48 +508,42 @@ impl AgentRuntime {
                                 match action {
                                     AgentAction::Speak(text) => {
                                         // Back-compat: treat direct speak as say.
-                                        let (sent_now, suppressed) = self.publish_say(
+                                        let published = self.publish_say(
                                             &topic,
                                             &conversation_id,
                                             serde_json::json!({ "text": text }),
-                                            &mut sent_public,
                                         )?;
-                                        dup_suppressed += suppressed.len();
                                         trace.push(ChatMessage {
                                             role: ChatRole::Tool,
                                             content: serde_json::json!({
-                                                "sent": sent_now,
-                                                "suppressed": suppressed,
+                                                "messages": published,
                                             })
                                             .to_string(),
                                             name: Some("say".to_string()),
                                         });
-                                        if sent_now.is_empty() && dup_suppressed >= 2 {
-                                            break;
-                                        }
-                                        continue;
+                                        break;
                                     }
                                     AgentAction::ToolCall { tool, args } => {
                                         steps += 1;
 
                                         if tool == "say" {
-                                            let (sent_now, suppressed) = self.publish_say(
-                                                &topic,
-                                                &conversation_id,
-                                                args,
-                                                &mut sent_public,
-                                            )?;
-                                            dup_suppressed += suppressed.len();
+                                            let args_json = serde_json::to_string(&args).unwrap_or_default();
+                                            if last_say_args_json.as_deref() == Some(&args_json) {
+                                                repeated_say_calls += 1;
+                                            }
+                                            last_say_args_json = Some(args_json);
+
+                                            let published = self.publish_say(&topic, &conversation_id, args)?;
                                             trace.push(ChatMessage {
                                                 role: ChatRole::Tool,
                                                 content: serde_json::json!({
-                                                    "sent": sent_now,
-                                                    "suppressed": suppressed,
+                                                    "messages": published,
                                                 })
                                                 .to_string(),
                                                 name: Some("say".to_string()),
                                             });
-                                            if sent_now.is_empty() && dup_suppressed >= 2 {
+                                            // Allow multiple say calls, but avoid infinite loops that keep issuing the exact same call.
+                                            if repeated_say_calls >= 1 {
                                                 break;
                                             }
                                             continue;
