@@ -343,6 +343,7 @@ impl Orchestrator {
         }
         let soul_dir = self.cfg.paths.unics_dir.join(id.as_str());
         tokio::fs::create_dir_all(&soul_dir).await?;
+        self.ensure_default_agent_files(&id, &soul_dir).await?;
 
         let topics = self
             .cfg
@@ -416,6 +417,53 @@ impl Orchestrator {
                 Event::SystemNotification(unicos_common::SystemNotification::AgentKilled { id }),
             ))?;
         }
+        Ok(())
+    }
+
+    async fn ensure_default_agent_files(&self, id: &AgentId, soul_dir: &Path) -> Result<(), UnicError> {
+        let soul_md = soul_dir.join("soul.md");
+        match tokio::fs::metadata(&soul_md).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let content = format!(
+                    r#"# {id}
+
+You are {id}, an agent running inside UnicOS.
+
+Rules:
+- Keep replies concise.
+- When the user says "Ping" (case-insensitive), reply exactly with "Pong" and nothing else.
+"#
+                );
+                tokio::fs::write(&soul_md, content).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        #[derive(Serialize)]
+        struct AgentDiskConfig<'a> {
+            id: &'a str,
+            topics: Vec<String>,
+            perception_window: usize,
+            tools_enabled: bool,
+        }
+
+        let cfg_json = soul_dir.join("config.json");
+        match tokio::fs::metadata(&cfg_json).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let cfg = AgentDiskConfig {
+                    id: id.as_str(),
+                    topics: self.cfg.agent.default_topics.clone(),
+                    perception_window: self.cfg.agent.perception_window,
+                    tools_enabled: self.cfg.agent.tools_enabled,
+                };
+                let json = serde_json::to_string_pretty(&cfg)?;
+                tokio::fs::write(&cfg_json, json).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         Ok(())
     }
 
@@ -619,5 +667,32 @@ tools_enabled = false
             std::env::remove_var("UNICOS_UNICS_DIR");
             std::env::remove_var("UNICOS_GOD_LOG");
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_creates_default_soul_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unics_dir = tmp.path().join("unics");
+        let god_log = tmp.path().join("god.log");
+        tokio::fs::create_dir_all(&unics_dir).await.unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths.unics_dir = unics_dir.clone();
+        cfg.paths.god_log = god_log;
+        cfg.llm = None;
+
+        let mut orch = Orchestrator::new(cfg);
+        orch.spawn_agent(AgentId::new("Alice")).await.unwrap();
+
+        let soul_dir = unics_dir.join("Alice");
+        assert!(tokio::fs::try_exists(soul_dir.join("soul.md"))
+            .await
+            .unwrap());
+        assert!(tokio::fs::try_exists(soul_dir.join("config.json"))
+            .await
+            .unwrap());
+
+        orch.kill_agent(AgentId::new("Alice")).await.unwrap();
+        orch.cancel.cancel();
     }
 }

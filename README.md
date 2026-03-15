@@ -43,6 +43,8 @@ cargo run -p unicos-cli -- --socket /tmp/unicos.sock
 
 内核会以 `$UNICOS_UNICS_DIR/<AgentId>/` 作为 Agent 的灵魂目录，Agent 会读取其中的 `soul.md` 注入系统提示词。
 
+`/spawn <AgentId>` 会在该目录下自动生成默认的 `soul.md` 与 `config.json`（若不存在）。
+
 ## Ping/Pong（只改 SOUL.md）
 
 1. 准备一个配置文件（把 `base_url` / `api_key_env` 改成你在 `~/chobits/config.toml` 里的值，模型用 `gpt-5.2`）：
